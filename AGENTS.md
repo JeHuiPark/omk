@@ -17,6 +17,7 @@ AI가 제품 개발을 성공적으로 진행하기 위해, 작업 전후로 아
 - **[`CONTRIBUTING.md`](CONTRIBUTING.md):** 오픈소스 기여 가이드 및 커밋 메시지 규칙
 - **[`docs/coding_conventions.md`](docs/coding_conventions.md):** 코딩 컨벤션, 문서화 규칙 및 테스트 전략
 - **[`docs/requirements/index.md`](docs/requirements/index.md):** 제품 요구사항 및 스펙 진입점(Entry Point)
+- **[`docs/requirements/glossary.md`](docs/requirements/glossary.md):** 프로젝트 핵심 구성요소(OMV CLI, OMV Skill, AI Agent 등) 및 도메인 경계의 고유 명칭과 역할 정의 (용어 사전)
 - **[`docs/architecture.md`](docs/architecture.md):** 시스템 세부 아키텍처 및 데이터 흐름 구조
 - **[`DIRECTORY_LAYOUT.md`](DIRECTORY_LAYOUT.md):** 프로젝트 디렉터리 레이아웃 및 물리적 모듈 구조
 - **[`docs/protocol_spec.json`](docs/protocol_spec.json):** JSON-RPC 기반 통신 프로토콜 규격
