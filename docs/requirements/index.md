@@ -3,6 +3,9 @@
 이 문서는 OMV 프로젝트의 전체 요구사항(Requirements)을 탐색하기 위한 진입점(Entry Point)입니다.
 상세 기획 및 스펙을 확인할 때는 아래 링크된 문서들을 참조하십시오.
 
+> [!IMPORTANT]
+> **용어 및 도메인 경계:** 기획 및 개발 시 의사소통 혼선을 방지하기 위해 반드시 [용어 사전 (Glossary)](glossary.md)에 정의된 시스템 경계 및 고유 명칭(OMV CLI, OMV Skill, AI Agent 등)을 숙지하고 일관되게 사용하십시오.
+
 ## 1. Management Framework (요구사항 관리 체계)
 - **Hierarchical Structure (3단계 계층 구조):** 
   1. **Business Requirements:** 제품이 해결하려는 거시적 목적과 프로젝트의 범위(Vision and Scope).
