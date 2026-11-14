@@ -503,6 +503,61 @@ impl JsonValue {
         out
     }
 
+    /// Serializes the [`JsonValue`] into a human-readable, indented multi-line JSON string.
+    pub fn to_pretty_json_string(&self) -> String {
+        let mut out = String::new();
+        self.write_pretty_json(&mut out, 0);
+        out.push('\n');
+        out
+    }
+
+    fn write_pretty_json(&self, out: &mut String, indent: usize) {
+        let pad = "  ".repeat(indent);
+        let child_pad = "  ".repeat(indent + 1);
+        match self {
+            Self::Null | Self::Bool(_) | Self::Number(_) | Self::Str(_) => {
+                self.write_json(out);
+            }
+            Self::Array(items) => {
+                if items.is_empty() {
+                    out.push_str("[]");
+                } else {
+                    out.push_str("[\n");
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(",\n");
+                        }
+                        out.push_str(&child_pad);
+                        item.write_pretty_json(out, indent + 1);
+                    }
+                    out.push('\n');
+                    out.push_str(&pad);
+                    out.push(']');
+                }
+            }
+            Self::Object(map) => {
+                if map.is_empty() {
+                    out.push_str("{}");
+                } else {
+                    out.push_str("{\n");
+                    for (i, (k, v)) in map.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(",\n");
+                        }
+                        out.push_str(&child_pad);
+                        out.push('"');
+                        escape_json_into(k, out);
+                        out.push_str("\": ");
+                        v.write_pretty_json(out, indent + 1);
+                    }
+                    out.push('\n');
+                    out.push_str(&pad);
+                    out.push('}');
+                }
+            }
+        }
+    }
+
     fn write_json(&self, out: &mut String) {
         match self {
             Self::Null => out.push_str("null"),

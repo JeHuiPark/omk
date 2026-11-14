@@ -69,18 +69,7 @@ impl DaemonPaths {
             ))
         })?;
 
-        let direct_sock = runtime_dir.join("daemon.sock");
-        // Unix domain socket paths have a strict length limit (~104 bytes on macOS).
-        let socket_path = if direct_sock.to_string_lossy().len() <= 92 {
-            direct_sock
-        } else {
-            let mut hash: u64 = 0xcbf29ce484222325;
-            for b in canonical_vault.to_string_lossy().as_bytes() {
-                hash ^= u64::from(*b);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            PathBuf::from(format!("/tmp/omk-{:016x}.sock", hash))
-        };
+        let socket_path = Self::compute_socket_path(&canonical_vault, &runtime_dir);
 
         Ok(Self {
             vault_dir: canonical_vault,
@@ -90,6 +79,39 @@ impl DaemonPaths {
             runtime_dir,
             socket_path,
         })
+    }
+
+    /// Resolves all daemon runtime paths for `vault_dir` without creating any directories on disk.
+    ///
+    /// Used by read-only diagnostic commands such as `omk status` (`REQ-CLI-003`).
+    pub fn inspect<P: AsRef<Path>>(vault_dir: P) -> Self {
+        let vdir = vault_dir.as_ref();
+        let canonical_vault = fs::canonicalize(vdir).unwrap_or_else(|_| vdir.to_path_buf());
+        let runtime_dir = canonical_vault.join(".omk");
+        let socket_path = Self::compute_socket_path(&canonical_vault, &runtime_dir);
+        Self {
+            vault_dir: canonical_vault,
+            db_path: runtime_dir.join("index.db"),
+            pid_path: runtime_dir.join("daemon.pid"),
+            log_path: runtime_dir.join("daemon.log"),
+            runtime_dir,
+            socket_path,
+        }
+    }
+
+    fn compute_socket_path(canonical_vault: &Path, runtime_dir: &Path) -> PathBuf {
+        let direct_sock = runtime_dir.join("daemon.sock");
+        // Unix domain socket paths have a strict length limit (~104 bytes on macOS).
+        if direct_sock.to_string_lossy().len() <= 92 {
+            direct_sock
+        } else {
+            let mut hash: u64 = 0xcbf29ce484222325;
+            for b in canonical_vault.to_string_lossy().as_bytes() {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            PathBuf::from(format!("/tmp/omk-{:016x}.sock", hash))
+        }
     }
 }
 
