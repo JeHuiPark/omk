@@ -1,5 +1,7 @@
 # omk (oh my knowledge)
 
+**English** | [한국어](README.ko.md)
+
 A standalone local knowledge vault skill and MCP daemon/proxy for AI agents.
 
 ## Overview
@@ -21,18 +23,17 @@ A standalone local knowledge vault skill and MCP daemon/proxy for AI agents.
 ## Quick Start
 
 ```bash
-# Build release binary
+# 1. Build release binary
 make build
 
-# Run full unit & integration test suite
+# 2. Run full unit & integration test suite
 make test
 
-# Provision the omk Skill (SKILL.md + mcp_config.json)
-./target/release/omk install --vault ~/.omk/vault --target ~/.omk/skill
-
-# Start MCP Stdio Proxy (auto-spawns background daemon if needed)
-./target/release/omk mcp --vault ~/.omk/vault
+# 3. One-time install (Auto-provisions SKILL.md and global MCP config)
+./target/release/omk install
 ```
+
+Once installed, you do not need to run CLI commands manually—simply talk to your AI agent in natural language, and the agent will automatically search, read, and save knowledge via `omk`.
 
 ## Documentation
 
