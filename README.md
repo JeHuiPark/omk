@@ -6,38 +6,39 @@ A standalone local knowledge vault skill and MCP daemon/proxy for AI agents.
 
 ## Overview
 
-`omk` enables AI agents to accumulate, search, and cross-reference persistent knowledge across conversations (**Proactive Grounding**). Built in pure Rust as a standalone binary with zero external crate dependencies, it combines human-readable Markdown files (Single Source of Truth) with a high-speed SQLite FTS5 index.
-
-## Architecture Highlights
-
-- **Global Daemon & Stdio Proxy (`EPIC-IPC-01`):**
-  - `omk daemon`: Singleton background process protected by OS `flock` (`daemon.pid`), handling all storage writes and queries over a Unix Domain Socket with backpressure protection (`-32001`).
-  - `omk mcp`: Lightweight Stdio MCP proxy spawned per AI agent session with auto-daemon spawning, exponential backoff retry, and strict socket timeouts (`-32000`).
-- **CQRS Pipeline & Storage Isolation (`EPIC-VAULT-01`, `EPIC-SEARCH-01`):**
-  - `DocumentStore` (`LocalMarkdownDocumentStore`): Atomic Markdown + YAML Frontmatter file writes and strict path traversal protection (`-32003`).
-  - `IndexStore` (`SqliteFtsIndexStore`): SQLite WAL mode + FTS5 full-text search + JSON metadata filtering.
-  - Startup Auto-Recovery (`reconcile`): Rebuilds missing or stale index entries by comparing Vault `version_hash` values on daemon startup.
-- **Provenance & Sync Strategies (`EPIC-DATA-01`):**
-  - Enforces authority boundaries (`USER_EXPLICIT`, `AGENT_INFERRED`, `EXTERNAL_SYNC`) and source-specific sync strategies (`UPSERT_FULL`, `APPEND_ONLY`, `STATE_PATCH`, `LINK_REFERENCE`).
+`omk` enables AI agents to accumulate, search, and cross-reference persistent knowledge across conversations (**Proactive Grounding**). Built in pure Rust as a single standalone binary with zero external crate dependencies, it pairs human-readable Markdown files (Single Source of Truth) with a fast SQLite FTS5 search index.
 
 ## Quick Start
 
 ```bash
-# 1. Build release binary
+# 1. Build the standalone binary
 make build
 
-# 2. Run full unit & integration test suite
-make test
-
-# 3. One-time install (Auto-provisions SKILL.md and global MCP config)
+# 2. Provision omk Skill & MCP config (auto-detects your installed AI harnesses)
 ./target/release/omk install
+
+# Or target specific harnesses explicitly:
+# (claude-code, claude-desktop, cursor, gemini/antigravity, codex, opencode, windsurf, all)
+./target/release/omk install --harness claude-code,cursor
+
+# 3. Verify your Local Vault, background daemon, and harness status
+./target/release/omk status
 ```
 
-Once installed, you do not need to run CLI commands manually—simply talk to your AI agent in natural language, and the agent will automatically search, read, and save knowledge via `omk`.
+### How It Works in Daily Use
+
+1. **Install Once (`omk install`):** Automatically detects your AI agent harnesses, non-destructively merges the `omk` MCP server into your existing configuration, and installs the `SKILL.md` instructions.
+2. **Zero Manual CLI Calls:** After installation, you never need to run `omk` commands to save or search notes. Simply talk to your AI agent in natural language—your agent will autonomously search prior context and save new decisions into `~/.omk/vault` (override via `OMK_VAULT_DIR` or `--vault <dir>`).
+3. **Inspect & Maintain Anytime:** Run `omk status` to check system health, `omk reconcile` if you edit Markdown files in the Vault directly, or `omk --help` for full CLI options (full CLI specification in [`EPIC-CLI-01`](docs/requirements/features/EPIC-CLI-01.md)).
 
 ## Documentation
 
-See [`AGENTS.md`](AGENTS.md) for the complete Knowledge Map, including [`CONSTITUTION.md`](CONSTITUTION.md), [`docs/architecture.md`](docs/architecture.md), [`docs/protocol_spec.json`](docs/protocol_spec.json), and [`docs/requirements/index.md`](docs/requirements/index.md).
+For system architecture, protocol schemas, and requirements specifications, refer to the Single Source of Truth (SSOT) documents mapped in [`AGENTS.md`](AGENTS.md):
+
+- [`CONSTITUTION.md`](CONSTITUTION.md): Core design principles and project governance
+- [`docs/architecture.md`](docs/architecture.md): Daemon-Proxy IPC, CQRS pipeline, and storage isolation design
+- [`docs/protocol_spec.json`](docs/protocol_spec.json): MCP & JSON-RPC 2.0 tool schemas and error codes
+- [`docs/requirements/index.md`](docs/requirements/index.md): Vision, scope, and feature specifications (`EPIC-*`)
 
 ## 🙏 Acknowledgments
 

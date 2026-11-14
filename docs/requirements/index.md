@@ -28,3 +28,4 @@
 - [EPIC-DATA-01: 지식 데이터 모델 및 출처 관리](features/EPIC-DATA-01.md)
 - [EPIC-SEARCH-01: 지식 검색 및 인덱싱](features/EPIC-SEARCH-01.md)
 - [EPIC-IPC-01: 에이전트-CLI 통신 프로토콜](features/EPIC-IPC-01.md)
+- [EPIC-CLI-01: 인간 친화적 CLI 사용성 및 다중 에이전트 하네스 프로비저닝](features/EPIC-CLI-01.md)
