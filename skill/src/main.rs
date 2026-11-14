@@ -3,11 +3,11 @@
 //! Supports subcommands:
 //! - `omk mcp [--vault <dir>]` (Default when invoked with no subcommand): Runs the Stdio MCP Proxy.
 //! - `omk daemon [--vault <dir>]`: Runs the global singleton background daemon.
-//! - `omk install [--vault <dir>] [--target <dir>]`: Provisions the `omk Skill` (`SKILL.md` & `mcp_config.json`).
+//! - `omk install [--vault <dir>] [--target <dir>]`: Automatically provisions the `omk Skill` and global MCP config into the user's AI agent environment.
 //! - `omk reconcile [--vault <dir>]`: Runs Vault-Index reconciliation (`fsck`) and prints a JSON report.
 //! - `omk stop [--vault <dir>]`: Gracefully stops a running `omk daemon` for the Vault.
 
-use omk::agent_prompt::install_skill;
+use omk::agent_prompt::{install_skill, render_mcp_config_json};
 use omk::daemon::{DaemonConfig, DaemonPaths, DaemonServer};
 use omk::protocol::format_rpc_error;
 use omk::proxy::{McpProxy, ProxyConfig};
@@ -15,6 +15,7 @@ use omk_core::domain::OmkError;
 use omk_core::index::SqliteFtsIndexStore;
 use omk_core::search::KnowledgePipeline;
 use omk_core::vault::LocalMarkdownDocumentStore;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -31,6 +32,13 @@ fn default_vault_dir() -> PathBuf {
         return PathBuf::from(home).join(".omk").join("vault");
     }
     std::env::temp_dir().join("omk-vault")
+}
+
+fn default_skill_target_dir(vault_dir: &PathBuf) -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".gemini").join("skills").join("omk");
+    }
+    vault_dir.join("skill")
 }
 
 fn parse_cli_args() -> (String, PathBuf, Option<PathBuf>) {
@@ -86,8 +94,28 @@ fn run() -> Result<(), OmkError> {
             proxy.run_stdio_loop()
         }
         "install" => {
-            let out_dir = target_dir.unwrap_or_else(|| vault_dir.join("skill"));
+            let is_default_target = target_dir.is_none();
+            let out_dir = target_dir.unwrap_or_else(|| default_skill_target_dir(&vault_dir));
             let res = install_skill(&out_dir, &vault_dir, None)?;
+
+            // When installing to the user's default environment, also wire ~/.gemini/config/mcp_config.json
+            if is_default_target {
+                if let Ok(home) = std::env::var("HOME") {
+                    let global_cfg_dir = PathBuf::from(home).join(".gemini").join("config");
+                    if fs::create_dir_all(&global_cfg_dir).is_ok() {
+                        let global_mcp_path = global_cfg_dir.join("mcp_config.json");
+                        let existing = fs::read_to_string(&global_mcp_path).unwrap_or_default();
+                        if existing.trim().is_empty() || existing.contains("\"omk\"") {
+                            let bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("omk"));
+                            let _ = fs::write(
+                                &global_mcp_path,
+                                render_mcp_config_json(&bin, &vault_dir),
+                            );
+                        }
+                    }
+                }
+            }
+
             println!(
                 r#"{{"status":"installed","skill_md":"{}","mcp_config":"{}"}}"#,
                 res.skill_md_path.display(),

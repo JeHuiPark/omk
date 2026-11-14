@@ -1,8 +1,8 @@
 //! Agent Skill Provisioning (`omk install`) and Proactive Grounding Prompt Templates.
 //!
-//! Generates the `omk Skill` package (`SKILL.md` and MCP configuration snippet) as defined in
-//! [`docs/requirements/glossary.md`](../../../docs/requirements/glossary.md) and
-//! [`docs/requirements/vision_and_scope.md`](../../../docs/requirements/vision_and_scope.md).
+//! Automatically provisions the `omk Skill` (`SKILL.md`) and registers the `omk` MCP server
+//! into the user's AI agent environment (`~/.gemini/config/mcp_config.json` and `~/.gemini/skills/omk/SKILL.md`)
+//! so the human user never needs to invoke the CLI manually during daily usage.
 
 use omk_core::domain::OmkError;
 use std::fs;
@@ -29,25 +29,36 @@ description: Standalone local knowledge vault skill for AI agents. Use to proact
 
 ## 1. Purpose: Proactive Grounding
 You have access to the `omk` Local Knowledge Vault located at `{vault}`.
-Before answering architectural, domain, or historical questions—or when a user introduces important new decisions—you MUST proactively query and update `omk` so knowledge compounds across conversations.
+The human user will NEVER call the `omk` CLI directly—YOU (the AI Agent) are responsible for transparently searching, reading, and saving knowledge on their behalf during natural conversation.
 
-## 2. Available MCP Tools
-- **`search_knowledge`**: Fast SQLite FTS5 full-text search and metadata (`tags`, `source_class`, `source_type`, `min_authority`) filtering. Always run `search_knowledge` first to discover relevant context snippets without loading full files.
-- **`read_knowledge`**: Reads the full Markdown body and YAML Frontmatter metadata of a specific document by `id` when deeper context is needed.
-- **`upsert_knowledge`**: Persists or updates knowledge according to source provenance:
-  - `USER_EXPLICIT`: Knowledge explicitly stated or confirmed by the human user (Authority: `1.0`). Protected from arbitrary `AGENT_INFERRED` overwrite.
-  - `AGENT_INFERRED`: Insights or summaries inferred by you during problem solving (Authority: `0.6`).
-  - `EXTERNAL_SYNC`: Knowledge synchronized from external systems (`WIKI`, `MESSENGER`, `ISSUE_TRACKER`, `CODE_REPO`).
+- **Before answering architectural, domain, or historical questions:** Proactively query `omk` (`search_knowledge` -> `read_knowledge`) to ground your response in prior project/user decisions.
+- **When the user states a rule, preference, or architectural decision:** Proactively save it (`upsert_knowledge`) so knowledge compounds across sessions.
 
-## 3. MCP Server Invocation
-`omk` runs via a lightweight Stdio Proxy (`{bin} mcp --vault {vault}`) backed by a global singleton daemon (`{bin} daemon --vault {vault}`).
+## 2. How to Call `omk` Tools
+If the `omk` MCP tools (`search_knowledge`, `read_knowledge`, `upsert_knowledge`) are mounted in your toolset, call them directly.
+If MCP tools are not yet mounted in the current session, invoke `{bin} mcp --vault {vault}` seamlessly via a one-line JSON-RPC command in your shell tool:
+
+- **Search Knowledge (`search_knowledge`):**
+  ```bash
+  printf '%s\n' '{{"jsonrpc":"2.0","id":1,"method":"search_knowledge","params":{{"query":"<KEYWORDS>","filters":{{"tags":[]}},"limit":5}}}}' | {bin} mcp --vault {vault}
+  ```
+- **Read Knowledge (`read_knowledge`):**
+  ```bash
+  printf '%s\n' '{{"jsonrpc":"2.0","id":1,"method":"read_knowledge","params":{{"id":"<DOC_ID>"}}}}' | {bin} mcp --vault {vault}
+  ```
+- **Save / Update Knowledge (`upsert_knowledge`):**
+  - `source.class`: `"USER_EXPLICIT"` (stated/approved by user, Authority 1.0), `"AGENT_INFERRED"` (inferred by agent, Authority 0.6), or `"EXTERNAL_SYNC"`.
+  - `source.type`: `"WIKI"` (`UPSERT_FULL`), `"MESSENGER"` (`APPEND_ONLY`), `"ISSUE_TRACKER"` (`STATE_PATCH`), `"CODE_REPO"` (`LINK_REFERENCE`), or `"GENERAL"`.
+  ```bash
+  printf '%s\n' '{{"jsonrpc":"2.0","id":1,"method":"upsert_knowledge","params":{{"title":"<TITLE>","content":"<MARKDOWN_BODY>","source":{{"class":"USER_EXPLICIT","type":"WIKI","provider":"local"}},"tags":["<TAG>"]}}}}' | {bin} mcp --vault {vault}
+  ```
 "#,
         vault = vault_dir.display(),
         bin = binary_path.display()
     )
 }
 
-/// Renders the MCP server configuration JSON for AI clients (Claude Desktop, Cursor, etc.).
+/// Renders the MCP server configuration JSON for AI clients (`~/.gemini/config/mcp_config.json`, Claude Desktop, Cursor, etc.).
 pub fn render_mcp_config_json(binary_path: &Path, vault_dir: &Path) -> String {
     format!(
         r#"{{
@@ -59,8 +70,14 @@ pub fn render_mcp_config_json(binary_path: &Path, vault_dir: &Path) -> String {
   }}
 }}
 "#,
-        binary_path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""),
-        vault_dir.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+        binary_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        vault_dir
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     )
 }
 
