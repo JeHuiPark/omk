@@ -29,3 +29,4 @@
 - [EPIC-SEARCH-01: 지식 검색 및 인덱싱](features/EPIC-SEARCH-01.md)
 - [EPIC-IPC-01: 에이전트-CLI 통신 프로토콜](features/EPIC-IPC-01.md)
 - [EPIC-CLI-01: 인간 친화적 CLI 사용성 및 다중 에이전트 하네스 프로비저닝](features/EPIC-CLI-01.md)
+- [EPIC-OBS-01: 프라이버시 보호 기반 실행 관측성 및 성능 진단 체계](features/EPIC-OBS-01.md)
