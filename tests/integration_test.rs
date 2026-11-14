@@ -1,13 +1,17 @@
 //! End-to-End Integration Tests across Vault File System, SQLite FTS5 Index,
-//! Global Singleton Daemon, and Stdio MCP Proxy (`EPIC-VAULT-01`, `EPIC-DATA-01`,
-//! `EPIC-SEARCH-01`, `EPIC-IPC-01`).
+//! Global Singleton Daemon, Stdio MCP Proxy, and CLI Multi-Harness UX (`EPIC-VAULT-01`,
+//! `EPIC-DATA-01`, `EPIC-SEARCH-01`, `EPIC-IPC-01`, `EPIC-CLI-01`).
 
-use omk::agent_prompt::install_skill;
+use omk::agent_prompt::{
+    detect_installed_harnesses, inspect_all_harnesses, install_for_selection, install_skill,
+    merge_mcp_config_file, HarnessKind, HarnessSelection,
+};
 use omk::daemon::{DaemonConfig, DaemonServer, PidLockGuard};
 use omk::proxy::{McpProxy, ProxyConfig};
 use omk_core::domain::JsonValue;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::thread;
 
@@ -259,4 +263,174 @@ fn test_skill_provisioning_creates_skill_md_and_mcp_config() {
     assert!(skill_md.contains("search_knowledge"));
 
     let _ = fs::remove_dir_all(&base_dir);
+}
+
+#[test]
+fn test_multi_harness_auto_detection_and_non_destructive_merge() {
+    let home = unique_test_dir("multi_harness");
+    let vault_dir = home.join(".omk").join("vault");
+    let bin = PathBuf::from("/usr/local/bin/omk");
+
+    // Simulate user having Claude Code (with an existing MCP server) and Cursor installed
+    let claude_cfg = home.join(".claude.json");
+    fs::write(
+        &claude_cfg,
+        r#"{"userTheme":"solarized","mcpServers":{"filesystem":{"command":"npx","args":["-y","server-fs"]}}}"#,
+    )
+    .expect("seed .claude.json");
+    fs::create_dir_all(home.join(".cursor")).expect("seed .cursor");
+
+    let detected = detect_installed_harnesses(&home, false);
+    assert_eq!(detected, vec![HarnessKind::ClaudeCode, HarnessKind::Cursor]);
+
+    // 1. Auto-detect install (REQ-CLI-004)
+    let reports = install_for_selection(
+        &HarnessSelection::Auto,
+        &home,
+        &vault_dir,
+        Some(&bin),
+        false,
+    )
+    .expect("auto install");
+    assert_eq!(reports.len(), 2);
+
+    // Verify non-destructive merge in .claude.json
+    let claude_after = fs::read_to_string(&claude_cfg).expect("read merged .claude.json");
+    let claude_json = JsonValue::parse(&claude_after).expect("parse merged .claude.json");
+    assert_eq!(
+        claude_json.get("userTheme").and_then(JsonValue::as_str),
+        Some("solarized")
+    );
+    let servers = claude_json.get("mcpServers").expect("mcpServers object");
+    assert!(
+        servers.get("filesystem").is_some(),
+        "Existing 'filesystem' MCP server must be preserved"
+    );
+    assert!(
+        servers.get("omk").is_some(),
+        "New 'omk' MCP server must be added"
+    );
+    assert!(home.join(".claude/skills/omk/SKILL.md").exists());
+    assert!(home.join(".cursor/mcp.json").exists());
+    assert!(home.join(".cursor/skills/omk/SKILL.md").exists());
+
+    // 2. Explicit --harness all (REQ-CLI-005)
+    let all_reports = install_for_selection(
+        &HarnessSelection::All,
+        &home,
+        &vault_dir,
+        Some(&bin),
+        false,
+    )
+    .expect("install all harnesses");
+    assert_eq!(all_reports.len(), 7);
+
+    let statuses = inspect_all_harnesses(&home, false);
+    assert_eq!(statuses.len(), 7);
+    assert!(
+        statuses.iter().all(|s| s.configured),
+        "All 7 harnesses must be marked as Configured after --harness all"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_cli_binary_ux_help_status_install_and_strict_error_handling() {
+    let base_dir = unique_test_dir("cli_bin");
+    let fake_home = base_dir.join("home");
+    let vault_dir = base_dir.join("vault");
+    fs::create_dir_all(fake_home.join(".codex")).expect("create fake .codex");
+
+    let bin = env!("CARGO_BIN_EXE_omk");
+
+    // 1. `omk --help` prints human-readable usage and exits 0 (REQ-CLI-001)
+    let help_out = Command::new(bin)
+        .arg("--help")
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run omk --help");
+    assert!(help_out.status.success());
+    let help_stdout = String::from_utf8_lossy(&help_out.stdout);
+    assert!(help_stdout.contains("USAGE:"));
+    assert!(help_stdout.contains("COMMANDS:"));
+    assert!(help_stdout.contains("--harness"));
+
+    // 2. Invalid subcommand or flag exits with code 2 and helpful error (REQ-CLI-001)
+    let bad_out = Command::new(bin)
+        .arg("unknown-subcommand")
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run omk unknown-subcommand");
+    assert!(!bad_out.status.success());
+    let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
+    assert!(bad_stderr.contains("[ERROR]"));
+    assert!(bad_stderr.contains("[HINT]"));
+
+    // 3. `omk install --harness codex,windsurf` provisions both in human-friendly mode (REQ-CLI-002, REQ-CLI-005)
+    let inst_out = Command::new(bin)
+        .args([
+            "install",
+            "--vault",
+            vault_dir.to_str().unwrap(),
+            "--harness",
+            "codex,windsurf",
+        ])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run omk install --harness");
+    assert!(inst_out.status.success());
+    let inst_stdout = String::from_utf8_lossy(&inst_out.stdout);
+    assert!(inst_stdout.contains("Provisioned Targets:"));
+    assert!(inst_stdout.contains("[codex]"));
+    assert!(inst_stdout.contains("[windsurf]"));
+    assert!(fake_home.join(".codex/mcp_config.json").exists());
+    assert!(fake_home.join(".codeium/windsurf/mcp_config.json").exists());
+
+    // 4. `omk status` (Human-readable) & `omk status --json` (Machine JSON) (REQ-CLI-003)
+    let status_out = Command::new(bin)
+        .args(["status", "--vault", vault_dir.to_str().unwrap()])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run omk status");
+    assert!(status_out.status.success());
+    let status_stdout = String::from_utf8_lossy(&status_out.stdout);
+    assert!(status_stdout.contains("[Local Vault]"));
+    assert!(status_stdout.contains("[Background Daemon]"));
+    assert!(status_stdout.contains("[AI Agent Harnesses]"));
+
+    let status_json_out = Command::new(bin)
+        .args(["status", "--vault", vault_dir.to_str().unwrap(), "--json"])
+        .env("HOME", &fake_home)
+        .output()
+        .expect("run omk status --json");
+    assert!(status_json_out.status.success());
+    let status_json_raw = String::from_utf8_lossy(&status_json_out.stdout);
+    let parsed_status = JsonValue::parse(status_json_raw.trim()).expect("valid status json");
+    assert_eq!(
+        parsed_status.get("status").and_then(JsonValue::as_str),
+        Some("ok")
+    );
+    let harnesses_arr = parsed_status
+        .get("harnesses")
+        .and_then(JsonValue::as_array)
+        .expect("harnesses array");
+    assert_eq!(harnesses_arr.len(), 7);
+
+    let _ = fs::remove_dir_all(&base_dir);
+}
+
+#[test]
+fn test_merge_mcp_config_preserves_malformed_file_as_bak() {
+    let dir = unique_test_dir("bak");
+    let cfg = dir.join("mcp_config.json");
+    fs::write(&cfg, "{broken:json").unwrap();
+
+    let bak = merge_mcp_config_file(&cfg, &PathBuf::from("omk"), &dir.join("vault"))
+        .expect("merge")
+        .expect("bak path");
+    assert!(bak.exists());
+    assert_eq!(fs::read_to_string(&bak).unwrap(), "{broken:json");
+
+    let _ = fs::remove_dir_all(&dir);
 }
