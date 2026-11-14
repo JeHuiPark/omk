@@ -1,0 +1,12 @@
+[package]
+name = "omk-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core domain models, storage traits, and CQRS pipelines for omk (oh my knowledge)"
+license = "MIT"
+
+[lib]
+name = "omk_core"
+path = "src/lib.rs"
+
+[dependencies]

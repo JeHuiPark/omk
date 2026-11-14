@@ -1,2 +1,10 @@
+.PHONY: build test clean
+
 build:
-	cd skill && cargo build --release
+	cargo build --release
+
+test:
+	cargo test --workspace
+
+clean:
+	cargo clean
