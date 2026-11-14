@@ -1,10 +1,10 @@
-# OMV (Oh My Vault) - Requirements Index
+# omk (oh my knowledge) - Requirements Index
 
-이 문서는 OMV 프로젝트의 전체 요구사항(Requirements)을 탐색하기 위한 진입점(Entry Point)입니다.
+이 문서는 omk 프로젝트의 전체 요구사항(Requirements)을 탐색하기 위한 진입점(Entry Point)입니다.
 상세 기획 및 스펙을 확인할 때는 아래 링크된 문서들을 참조하십시오.
 
 > [!IMPORTANT]
-> **용어 및 도메인 경계:** 기획 및 개발 시 의사소통 혼선을 방지하기 위해 반드시 [용어 사전 (Glossary)](glossary.md)에 정의된 시스템 경계 및 고유 명칭(OMV CLI, OMV Skill, AI Agent 등)을 숙지하고 일관되게 사용하십시오.
+> **용어 및 도메인 경계:** 기획 및 개발 시 의사소통 혼선을 방지하기 위해 반드시 [용어 사전 (Glossary)](glossary.md)에 정의된 시스템 경계 및 고유 명칭(omk CLI, omk Skill, AI Agent 등)을 숙지하고 일관되게 사용하십시오.
 
 ## 1. Management Framework (요구사항 관리 체계)
 - **Hierarchical Structure (3단계 계층 구조):** 
@@ -23,6 +23,8 @@
 - [Vision and Scope](vision_and_scope.md) : 프로젝트 정체성, 목적, 핵심 목표
 
 ## 3. User & Functional Requirements (Features)
-*(현재 등록된 세부 기능 스펙이 없습니다. 기능 추가 시 `features/` 디렉터리에 파일을 생성하고 이곳에 링크하십시오.)*
 
-- `features/` (TBD)
+- [EPIC-VAULT-01: Markdown 기반 영구 지식 저장소](features/EPIC-VAULT-01.md)
+- [EPIC-DATA-01: 지식 데이터 모델 및 출처 관리](features/EPIC-DATA-01.md)
+- [EPIC-SEARCH-01: 지식 검색 및 인덱싱](features/EPIC-SEARCH-01.md)
+- [EPIC-IPC-01: 에이전트-CLI 통신 프로토콜](features/EPIC-IPC-01.md)

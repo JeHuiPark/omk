@@ -1,6 +1,6 @@
-# Contributing to omv (Oh My Vault)
+# Contributing to omk (oh my knowledge)
 
-First off, thank you for considering contributing to `omv`! It's people like you that make the open-source community such a great place to learn, inspire, and create.
+First off, thank you for considering contributing to `omk`! It's people like you that make the open-source community such a great place to learn, inspire, and create.
 
 ## Commit Convention
 

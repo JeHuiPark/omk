@@ -1,1 +1,217 @@
-{}
+{
+  "jsonrpc": "2.0",
+  "protocolVersion": "2024-11-05",
+  "name": "omk",
+  "version": "0.1.0",
+  "description": "omk (oh my knowledge) MCP & JSON-RPC 2.0 Protocol Specification",
+  "lifecycle": {
+    "initialize": {
+      "description": "Initializes the MCP session and returns server capabilities.",
+      "params": {
+        "protocolVersion": "string (optional)",
+        "capabilities": "object (optional)",
+        "clientInfo": "object (optional)"
+      },
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {}
+        },
+        "serverInfo": {
+          "name": "omk",
+          "version": "0.1.0"
+        }
+      }
+    },
+    "ping": {
+      "description": "Health check between client, proxy, and daemon.",
+      "params": {},
+      "result": {}
+    },
+    "tools/list": {
+      "description": "Returns the list of available tools exposed by omk.",
+      "params": {},
+      "result": {
+        "tools": [
+          "upsert_knowledge",
+          "search_knowledge",
+          "read_knowledge"
+        ]
+      }
+    },
+    "tools/call": {
+      "description": "Invokes a specific tool by name with arguments.",
+      "params": {
+        "name": "string (upsert_knowledge | search_knowledge | read_knowledge)",
+        "arguments": "object"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "string (JSON serialized tool output)"
+          }
+        ],
+        "structuredContent": "object (direct tool output)",
+        "isError": "boolean"
+      }
+    }
+  },
+  "tools": {
+    "upsert_knowledge": {
+      "type": "command",
+      "description": "Creates or updates knowledge in the Local Vault according to source provenance and sync strategy.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["title", "content", "source"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Optional knowledge ID. If omitted, a deterministic or unique ID is generated."
+          },
+          "title": {
+            "type": "string",
+            "description": "Title of the knowledge document."
+          },
+          "content": {
+            "type": "string",
+            "description": "Markdown body content."
+          },
+          "source": {
+            "type": "object",
+            "required": ["class"],
+            "properties": {
+              "class": {
+                "type": "string",
+                "enum": ["USER_EXPLICIT", "AGENT_INFERRED", "EXTERNAL_SYNC"]
+              },
+              "type": {
+                "type": "string",
+                "enum": ["WIKI", "MESSENGER", "ISSUE_TRACKER", "CODE_REPO", "GENERAL"]
+              },
+              "provider": {
+                "type": "string"
+              },
+              "uri": {
+                "type": "string"
+              },
+              "external_id": {
+                "type": "string"
+              }
+            }
+          },
+          "sync_strategy": {
+            "type": "string",
+            "enum": ["UPSERT_FULL", "APPEND_ONLY", "STATE_PATCH", "LINK_REFERENCE"],
+            "description": "Optional override; defaults based on source.type."
+          },
+          "authority": {
+            "type": "number",
+            "description": "Optional authority score (0.0 to 1.0). Defaults based on source.class."
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "author": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Optional stateful status (e.g. Open/Closed for ISSUE_TRACKER)."
+          }
+        }
+      },
+      "outputSchema": {
+        "id": "string",
+        "status": "string (created | updated)",
+        "version_hash": "string",
+        "file_path": "string"
+      }
+    },
+    "search_knowledge": {
+      "type": "query",
+      "description": "Searches indexed knowledge using FTS5 full-text search and metadata filters.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Optional FTS5 search query string (supports AND, OR, phrase matching)."
+          },
+          "filters": {
+            "type": "object",
+            "properties": {
+              "tags": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "source_class": {
+                "type": "string",
+                "enum": ["USER_EXPLICIT", "AGENT_INFERRED", "EXTERNAL_SYNC"]
+              },
+              "source_type": {
+                "type": "string",
+                "enum": ["WIKI", "MESSENGER", "ISSUE_TRACKER", "CODE_REPO", "GENERAL"]
+              },
+              "min_authority": {
+                "type": "number"
+              }
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "default": 10
+          }
+        }
+      },
+      "outputSchema": {
+        "matches": [
+          {
+            "id": "string",
+            "file_path": "string",
+            "title": "string",
+            "snippet": "string",
+            "source_class": "string",
+            "source_type": "string",
+            "authority": "number",
+            "tags": ["string"]
+          }
+        ]
+      }
+    },
+    "read_knowledge": {
+      "type": "query",
+      "description": "Reads a single knowledge document and its complete metadata by ID.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier of the knowledge document."
+          }
+        }
+      },
+      "outputSchema": {
+        "id": "string",
+        "file_path": "string",
+        "title": "string",
+        "content": "string",
+        "metadata": "object"
+      }
+    }
+  },
+  "errors": {
+    "-32700": "Parse Error",
+    "-32600": "Invalid Request",
+    "-32601": "Method Not Found",
+    "-32602": "Invalid Params",
+    "-32603": "Internal Error",
+    "-32000": "Daemon Unreachable or Timeout",
+    "-32001": "Server Busy (Backpressure)",
+    "-32002": "Authority Violation",
+    "-32003": "Path Traversal or Access Denied",
+    "-32004": "Knowledge Not Found"
+  }
+}

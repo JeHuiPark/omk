@@ -1,4 +1,4 @@
-# OMV (Oh My Vault) - Project Constitution
+# omk (oh my knowledge) - Project Constitution
 
 ## 1. Architecture & Design Principles
 - **Agent-Agnostic (에이전트 범용성):** 특정 플랫폼이나 AI 클라이언트(IDE 등)에 종속되지 않는 범용성을 유지한다.

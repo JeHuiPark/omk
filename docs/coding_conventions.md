@@ -1,6 +1,6 @@
-# OMV (Oh My Vault) - Coding Conventions & Testing Strategy
+# omk (oh my knowledge) - Coding Conventions & Testing Strategy
 
-This document outlines the coding standards, conventions, and testing strategies required when developing the `omv` project.
+This document outlines the coding standards, conventions, and testing strategies required when developing the `omk` project.
 
 ## 1. Documentation
 - **Rustdoc (`///`):** Writing documentation is mandatory for all `public` modules, structs, traits, and functions. 
