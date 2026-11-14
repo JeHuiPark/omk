@@ -6,10 +6,14 @@ use omk::agent_prompt::{
     detect_installed_harnesses, inspect_all_harnesses, install_for_selection, install_skill,
     merge_mcp_config_file, HarnessKind, HarnessSelection,
 };
-use omk::daemon::{DaemonConfig, DaemonServer, PidLockGuard};
+use omk::daemon::{
+    compute_telemetry_stats, write_structured_log_with_limits, DaemonConfig, DaemonServer,
+    PidLockGuard,
+};
 use omk::proxy::{McpProxy, ProxyConfig};
 use omk_core::domain::JsonValue;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -433,4 +437,277 @@ fn test_merge_mcp_config_preserves_malformed_file_as_bak() {
     assert_eq!(fs::read_to_string(&bak).unwrap(), "{broken:json");
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_observability_spans_zero_pii_leak_and_salted_hashing() {
+    let vault_dir = unique_test_dir("obs_privacy");
+    let daemon_cfg = DaemonConfig::new(&vault_dir).expect("daemon config");
+    let server = DaemonServer::initialize(daemon_cfg.clone()).expect("init daemon");
+    let shutdown = server.shutdown_handle();
+
+    // Verify telemetry.salt was created with 0600 permissions (REQ-OBS-003)
+    assert!(daemon_cfg.paths.salt_path.exists());
+    let salt_mode = fs::metadata(&daemon_cfg.paths.salt_path)
+        .expect("salt metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(salt_mode, 0o600);
+
+    let server_thread = thread::spawn(move || {
+        server.run_blocking().expect("daemon run_blocking");
+    });
+
+    let mut proxy_cfg = ProxyConfig::new(&vault_dir).expect("proxy config");
+    proxy_cfg.auto_spawn_daemon = false;
+    proxy_cfg.max_connect_retries = 20;
+    proxy_cfg.base_backoff_ms = 10;
+    let proxy = McpProxy::new(proxy_cfg);
+
+    // 1. Upsert with sensitive canary strings (REQ-OBS-001, REQ-OBS-002, REQ-OBS-003)
+    let upsert_req = r#"{
+        "jsonrpc":"2.0",
+        "id":10,
+        "method":"tools/call",
+        "params":{
+            "name":"upsert_knowledge",
+            "arguments":{
+                "id":"secret-doc-id-777",
+                "title":"PRIVATE_TITLE_999",
+                "content":"SECRET_PII_CONTENT_12345 with confidential details.",
+                "source":{
+                    "class":"USER_EXPLICIT",
+                    "type":"WIKI",
+                    "provider":"confluence",
+                    "uri":"https://internal.secret.corp/pages/999",
+                    "external_id":"CONF-SECRET-999"
+                },
+                "tags":["confidential-tag-xyz"],
+                "author":"secret_author@company.com"
+            }
+        }
+    }"#;
+    let (upsert_resp, proxy_timings) =
+        proxy.forward_line_timed(&upsert_req.replace('\n', " "));
+    assert!(upsert_resp.is_some());
+    assert!(proxy_timings.proxy_total_us >= proxy_timings.ipc_roundtrip_us);
+    assert!(proxy_timings.proxy_connect_us > 0);
+
+    // 2. Search with sensitive query token returning 0 hits twice (Zero-hit & Repeated Query Churn)
+    let search_zero_req = r#"{
+        "jsonrpc":"2.0",
+        "id":11,
+        "method":"tools/call",
+        "params":{
+            "name":"search_knowledge",
+            "arguments":{
+                "query":"SENSITIVE_QUERY_TOKEN AND nonexistent_keyword",
+                "filters":{"tags":["confidential-tag-xyz"]},
+                "limit":5
+            }
+        }
+    }"#;
+    let _ = proxy
+        .forward_line(&search_zero_req.replace('\n', " "))
+        .expect("zero-hit search 1");
+    let _ = proxy
+        .forward_line(&search_zero_req.replace('\n', " "))
+        .expect("zero-hit search 2 (churn)");
+
+    // 3. Search with hit
+    let search_hit_req = r#"{
+        "jsonrpc":"2.0",
+        "id":12,
+        "method":"search_knowledge",
+        "params":{"query":"confidential","limit":5}
+    }"#;
+    let _ = proxy
+        .forward_line(search_hit_req)
+        .expect("hit search");
+
+    // 4. Read knowledge (hit + not-found error with sensitive ID)
+    let read_ok_req = r#"{
+        "jsonrpc":"2.0",
+        "id":13,
+        "method":"read_knowledge",
+        "params":{"id":"secret-doc-id-777"}
+    }"#;
+    let _ = proxy.forward_line(read_ok_req).expect("read ok");
+
+    let read_err_req = r#"{
+        "jsonrpc":"2.0",
+        "id":14,
+        "method":"read_knowledge",
+        "params":{"id":"nonexistent-secret-id-888"}
+    }"#;
+    let _ = proxy.forward_line(read_err_req).expect("read error");
+
+    shutdown.store(true, Ordering::SeqCst);
+    server_thread.join().expect("daemon thread join");
+
+    // Verify daemon.log exists, has 0600 permissions, and contains ZERO canary strings
+    let raw_log = fs::read_to_string(&daemon_cfg.paths.log_path).expect("read daemon.log");
+    let canaries = [
+        "SECRET_PII_CONTENT_12345",
+        "PRIVATE_TITLE_999",
+        "SENSITIVE_QUERY_TOKEN",
+        "secret_author@company.com",
+        "secret-doc-id-777",
+        "https://internal.secret.corp/pages/999",
+        "CONF-SECRET-999",
+        "confidential-tag-xyz",
+        "nonexistent-secret-id-888",
+    ];
+    for canary in canaries {
+        assert!(
+            !raw_log.contains(canary),
+            "Zero-PII violation: daemon.log leaked sensitive canary '{}'",
+            canary
+        );
+    }
+
+    // Verify salted hashes (doc# and qry#) and microsecond span fields exist in daemon.log
+    assert!(raw_log.contains("\"doc_ref\":\"doc#"));
+    assert!(raw_log.contains("\"query_ref\":\"qry#"));
+    assert!(raw_log.contains("\"validate_read_us\":"));
+    assert!(raw_log.contains("\"vault_write_us\":"));
+    assert!(raw_log.contains("\"vault_fsync_us\":"));
+    assert!(raw_log.contains("\"index_write_us\":"));
+    assert!(raw_log.contains("\"fts_build_us\":"));
+    assert!(raw_log.contains("\"db_open_us\":"));
+    assert!(raw_log.contains("\"fts_query_us\":"));
+    assert!(raw_log.contains("\"filter_post_us\":"));
+    assert!(raw_log.contains("\"vault_read_us\":"));
+    assert!(raw_log.contains("\"markdown_parse_us\":"));
+
+    // Verify `omk stats` and `omk stats --json` and `omk stats --reset` via CLI binary (REQ-OBS-005)
+    let bin = env!("CARGO_BIN_EXE_omk");
+    let stats_out = Command::new(bin)
+        .args([
+            "stats",
+            "--vault",
+            vault_dir.to_str().unwrap(),
+            "--slow-ms",
+            "0",
+        ])
+        .output()
+        .expect("run omk stats");
+    assert!(stats_out.status.success());
+    let stats_stdout = String::from_utf8_lossy(&stats_out.stdout);
+    assert!(stats_stdout.contains("[1. Overview & Lifecycle Summary]"));
+    assert!(stats_stdout.contains("[2. Tool Latency Breakdown (ms)]"));
+    assert!(stats_stdout.contains("[3. Stage Bottleneck Attribution]"));
+    assert!(stats_stdout.contains("[4. Agent Efficiency & Search Quality]"));
+    assert!(stats_stdout.contains("[5. Slow Request Anomalies"));
+    for canary in canaries {
+        assert!(
+            !stats_stdout.contains(canary),
+            "Zero-PII violation: omk stats output leaked canary '{}'",
+            canary
+        );
+    }
+
+    let stats_json_out = Command::new(bin)
+        .args([
+            "stats",
+            "--vault",
+            vault_dir.to_str().unwrap(),
+            "--slow-ms",
+            "0",
+            "--json",
+        ])
+        .output()
+        .expect("run omk stats --json");
+    assert!(stats_json_out.status.success());
+    let stats_json_raw = String::from_utf8_lossy(&stats_json_out.stdout);
+    for canary in canaries {
+        assert!(
+            !stats_json_raw.contains(canary),
+            "Zero-PII violation: omk stats --json leaked canary '{}'",
+            canary
+        );
+    }
+    let parsed_stats = JsonValue::parse(stats_json_raw.trim()).expect("valid stats json");
+    let overview = parsed_stats.get("overview").expect("overview object");
+    assert_eq!(
+        overview.get("total_requests").and_then(JsonValue::as_f64),
+        Some(6.0)
+    );
+    assert_eq!(
+        overview.get("succeeded_requests").and_then(JsonValue::as_f64),
+        Some(5.0)
+    );
+    assert_eq!(
+        overview.get("failed_requests").and_then(JsonValue::as_f64),
+        Some(1.0)
+    );
+    let eff = parsed_stats
+        .get("agent_efficiency")
+        .expect("agent_efficiency object");
+    assert_eq!(
+        eff.get("total_searches").and_then(JsonValue::as_f64),
+        Some(3.0)
+    );
+    assert_eq!(
+        eff.get("zero_hit_searches").and_then(JsonValue::as_f64),
+        Some(2.0)
+    );
+    assert_eq!(
+        eff.get("repeated_query_churn").and_then(JsonValue::as_f64),
+        Some(1.0)
+    );
+
+    // Verify `omk stats --reset --json` clears logs
+    let reset_out = Command::new(bin)
+        .args(["stats", "--vault", vault_dir.to_str().unwrap(), "--reset", "--json"])
+        .output()
+        .expect("run omk stats --reset");
+    assert!(reset_out.status.success());
+    let reset_json =
+        JsonValue::parse(String::from_utf8_lossy(&reset_out.stdout).trim()).expect("reset json");
+    assert_eq!(
+        reset_json.get("status").and_then(JsonValue::as_str),
+        Some("reset")
+    );
+    let after_reset = compute_telemetry_stats(&daemon_cfg.paths, None, 50.0);
+    assert_eq!(after_reset.total_requests, 0);
+
+    let _ = fs::remove_dir_all(&vault_dir);
+}
+
+#[test]
+fn test_log_rotation_enforces_max_size_and_backup_retention() {
+    let vault_dir = unique_test_dir("log_rotate");
+    let cfg = DaemonConfig::new(&vault_dir).expect("config");
+    let log_path = &cfg.paths.log_path;
+
+    // Set a 500-byte limit with max 3 backups (`daemon.log.1` .. `daemon.log.3`)
+    for i in 0..25 {
+        write_structured_log_with_limits(
+            log_path,
+            "INFO",
+            "rotation_test_event",
+            &format!("entry_index={} padding_data_for_rotation_check", i),
+            500,
+            3,
+        );
+    }
+
+    assert!(log_path.exists());
+    assert!(PathBuf::from(format!("{}.1", log_path.display())).exists());
+    assert!(PathBuf::from(format!("{}.2", log_path.display())).exists());
+    assert!(PathBuf::from(format!("{}.3", log_path.display())).exists());
+    assert!(
+        !PathBuf::from(format!("{}.4", log_path.display())).exists(),
+        "Backups beyond max_log_backups (3) must be pruned"
+    );
+    let active_len = fs::metadata(log_path).expect("log metadata").len();
+    assert!(
+        active_len <= 500,
+        "Active daemon.log size ({}) must not exceed max_bytes (500)",
+        active_len
+    );
+
+    let _ = fs::remove_dir_all(&vault_dir);
 }
