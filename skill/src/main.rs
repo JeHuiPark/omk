@@ -1,10 +1,12 @@
-//! CLI Entry Point for `omk` (oh my knowledge) (`EPIC-CLI-01`, `EPIC-IPC-01`).
+//! CLI Entry Point for `omk` (oh my knowledge) (`EPIC-CLI-01`, `EPIC-IPC-01`, `EPIC-OBS-01`).
 //!
 //! Supports subcommands:
 //! - `omk install [--vault <dir>] [--harness <spec>] [--target <dir>] [--json]`:
 //!   Automatically detects or targets AI agent harnesses and provisions `SKILL.md` and MCP configs.
 //! - `omk status [--vault <dir>] [--json]`:
-//!   Read-only diagnostics for the Local Vault, SQLite index, background daemon, and harnesses.
+//!   Read-only diagnostics for the Local Vault, SQLite index, background daemon, harnesses, and observability.
+//! - `omk stats [--vault <dir>] [--last <N>] [--slow-ms <ms>] [--reset] [--json]`:
+//!   Privacy-preserving performance and agent efficiency analytics (`REQ-OBS-005`).
 //! - `omk reconcile [--vault <dir>] [--json]`:
 //!   Runs Vault-Index reconciliation (`fsck`) and prints a summary report.
 //! - `omk stop [--vault <dir>] [--json]`:
@@ -20,10 +22,13 @@ use omk::agent_prompt::{
     inspect_all_harnesses, install_for_selection, install_skill, HarnessProvisionReport,
     HarnessSelection,
 };
-use omk::daemon::{DaemonConfig, DaemonPaths, DaemonServer};
+use omk::daemon::{
+    compute_telemetry_stats, reset_telemetry_logs, DaemonConfig, DaemonPaths, DaemonServer,
+    TelemetryStatsReport,
+};
 use omk::protocol::format_rpc_error;
 use omk::proxy::{McpProxy, ProxyConfig};
-use omk_core::domain::{JsonValue, OmkError};
+use omk_core::domain::{sanitize_system_path, JsonValue, OmkError};
 use omk_core::index::{IndexStore, SqliteFtsIndexStore};
 use omk_core::search::KnowledgePipeline;
 use omk_core::vault::LocalMarkdownDocumentStore;
@@ -65,13 +70,15 @@ fn default_vault_dir() -> PathBuf {
     default_home_dir().join(".omk").join("vault")
 }
 
-/// Parsed CLI command and options (`REQ-CLI-001`, `REQ-CLI-002`, `REQ-CLI-005`).
+/// Parsed CLI command and options (`REQ-CLI-001`, `REQ-CLI-002`, `REQ-CLI-005`, `REQ-OBS-005`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subcommand {
     /// `omk install`
     Install,
     /// `omk status`
     Status,
+    /// `omk stats`
+    Stats,
     /// `omk reconcile`
     Reconcile,
     /// `omk stop`
@@ -100,11 +107,17 @@ pub struct CliOptions {
     pub target_dir: Option<PathBuf>,
     /// Optional harness target specification (`--harness` / `-H`).
     pub harness_spec: Option<String>,
+    /// Optional limit of recent RPC events to analyze in `omk stats` (`--last <N>`).
+    pub last_n: Option<usize>,
+    /// Slow request anomaly threshold in milliseconds for `omk stats` (`--slow-ms <ms>`, default 50.0).
+    pub slow_threshold_ms: f64,
+    /// Whether to reset telemetry logs in `omk stats` (`--reset`).
+    pub reset_stats: bool,
     /// Whether machine-readable single-line JSON output was requested (`--json`).
     pub json_output: bool,
 }
 
-/// Strictly parses command-line arguments (`REQ-CLI-001`).
+/// Strictly parses command-line arguments (`REQ-CLI-001`, `REQ-OBS-005`).
 ///
 /// Rejects unknown subcommands, unknown flags, and flags missing required values.
 fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, String> {
@@ -112,6 +125,9 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
     let mut vault_dir = default_vault_dir();
     let mut target_dir: Option<PathBuf> = None;
     let mut harness_spec: Option<String> = None;
+    let mut last_n: Option<usize> = None;
+    let mut slow_threshold_ms: f64 = 50.0;
+    let mut reset_stats = false;
     let mut json_output = false;
     let mut help_requested = false;
     let mut version_requested = false;
@@ -131,6 +147,42 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
             "--json" => {
                 json_output = true;
                 i += 1;
+            }
+            "--reset" => {
+                reset_stats = true;
+                i += 1;
+            }
+            "--last" => {
+                let val = args.get(i + 1).ok_or_else(|| {
+                    "Option '--last' requires a positive integer count.\n[HINT] Example: omk stats --last 100"
+                        .to_string()
+                })?;
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--last' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                last_n = Some(parsed);
+                i += 2;
+            }
+            "--slow-ms" => {
+                let val = args.get(i + 1).ok_or_else(|| {
+                    "Option '--slow-ms' requires a threshold in milliseconds.\n[HINT] Example: omk stats --slow-ms 25"
+                        .to_string()
+                })?;
+                let parsed = val
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .ok_or_else(|| {
+                        format!(
+                            "Option '--slow-ms' requires a non-negative number, but found '{}'.",
+                            val
+                        )
+                    })?;
+                slow_threshold_ms = parsed;
+                i += 2;
             }
             "--vault" | "-v" => {
                 let val = args.get(i + 1).ok_or_else(|| {
@@ -204,13 +256,39 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                 harness_spec = Some(val.to_string());
                 i += 1;
             }
+            _ if arg.starts_with("--last=") => {
+                let val = &arg["--last=".len()..];
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--last=' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                last_n = Some(parsed);
+                i += 1;
+            }
+            _ if arg.starts_with("--slow-ms=") => {
+                let val = &arg["--slow-ms=".len()..];
+                let parsed = val
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .ok_or_else(|| {
+                        format!(
+                            "Option '--slow-ms=' requires a non-negative number, but found '{}'.",
+                            val
+                        )
+                    })?;
+                slow_threshold_ms = parsed;
+                i += 1;
+            }
             _ if arg.starts_with('-') => {
                 return Err(format!(
                     "Unknown option '{}'.\n[HINT] Run 'omk --help' to see available commands and options.",
                     arg
                 ));
             }
-            "install" | "status" | "reconcile" | "stop" | "mcp" | "daemon" | "help" => {
+            "install" | "status" | "stats" | "reconcile" | "stop" | "mcp" | "daemon" | "help" => {
                 if subcommand.is_some() {
                     return Err(format!(
                         "Unexpected extra subcommand '{}'. Only one subcommand may be specified.",
@@ -220,6 +298,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                 subcommand = Some(match arg {
                     "install" => Subcommand::Install,
                     "status" => Subcommand::Status,
+                    "stats" => Subcommand::Stats,
                     "reconcile" => Subcommand::Reconcile,
                     "stop" => Subcommand::Stop,
                     "mcp" => Subcommand::Mcp { explicit: true },
@@ -235,7 +314,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     continue;
                 }
                 return Err(format!(
-                    "Unknown command '{}'.\n[HINT] Did you mean one of: install, status, reconcile, stop, mcp, daemon, help? Run 'omk --help' for usage.",
+                    "Unknown command '{}'.\n[HINT] Did you mean one of: install, status, stats, reconcile, stop, mcp, daemon, help? Run 'omk --help' for usage.",
                     other
                 ));
             }
@@ -261,6 +340,9 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
         vault_dir,
         target_dir,
         harness_spec,
+        last_n,
+        slow_threshold_ms,
+        reset_stats,
         json_output,
     })
 }
@@ -276,6 +358,7 @@ USAGE:
 COMMANDS:
   install     Auto-detect AI agent harnesses and provision SKILL.md + MCP config
   status      Inspect Local Vault, SQLite index, background daemon, and harnesses
+  stats       Analyze execution latency percentiles, stage bottlenecks, and search quality
   reconcile   Verify and repair Vault Markdown <-> SQLite FTS5 index consistency
   stop        Gracefully stop the running background daemon for the Vault
   mcp         Run the Stdio MCP / JSON-RPC 2.0 proxy (used by AI agent harnesses)
@@ -289,6 +372,9 @@ OPTIONS:
                          codex, opencode, windsurf
   -v, --vault <DIR>      Path to Local Vault directory [default: {vault}]
   -t, --target <DIR>     Custom output directory for SKILL.md & mcp_config.json
+      --last <N>         Analyze only the most recent N RPC requests in 'omk stats'
+      --slow-ms <MS>     Threshold in ms for slow request anomalies in 'omk stats' [default: 50]
+      --reset            Clear local telemetry log files in 'omk stats'
       --json             Output machine-readable single-line JSON
   -V, --version          Display version information
   -h, --help             Display help information
@@ -298,6 +384,7 @@ EXAMPLES:
   omk install --harness claude-code,cursor      # Provision specific harnesses only
   omk install --harness all                     # Provision all 7 supported harnesses
   omk status                                    # Check Vault, daemon, and harness status
+  omk stats                                     # View P50/P95 latency & stage bottleneck report
   omk reconcile                                 # Rebuild/sync SQLite index from Vault Markdown
 "#,
         ver = VERSION,
@@ -446,6 +533,12 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
     let (daemon_running, pid_opt) = check_daemon_alive(&paths);
     let home = default_home_dir();
     let harnesses = inspect_all_harnesses(&home, false);
+    let obs_stats = compute_telemetry_stats(&paths, None, 50.0);
+    let all_lat = obs_stats
+        .latency_by_tool
+        .get("all")
+        .cloned()
+        .unwrap_or_default();
 
     if json_output {
         let mut vault_obj = BTreeMap::new();
@@ -507,11 +600,30 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
             })
             .collect();
 
+        let mut obs_obj = BTreeMap::new();
+        obs_obj.insert(
+            "total_requests".to_string(),
+            JsonValue::Number(obs_stats.total_requests as f64),
+        );
+        obs_obj.insert(
+            "failed_requests".to_string(),
+            JsonValue::Number(obs_stats.failed_requests as f64),
+        );
+        obs_obj.insert(
+            "cold_starts".to_string(),
+            JsonValue::Number(obs_stats.cold_starts as f64),
+        );
+        obs_obj.insert(
+            "p95_latency_ms".to_string(),
+            JsonValue::Number(round_f64(all_lat.p95_ms)),
+        );
+
         let mut root = BTreeMap::new();
         root.insert("status".to_string(), JsonValue::Str("ok".to_string()));
         root.insert("vault".to_string(), JsonValue::Object(vault_obj));
         root.insert("daemon".to_string(), JsonValue::Object(daemon_obj));
         root.insert("harnesses".to_string(), JsonValue::Array(harness_arr));
+        root.insert("observability".to_string(), JsonValue::Object(obs_obj));
         println!("{}", JsonValue::Object(root).to_json_string());
     } else {
         println!("omk v{} - System & Harness Status", VERSION);
@@ -550,6 +662,19 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
             );
         }
         println!();
+        println!("[Observability Summary]");
+        println!(
+            "  Logged Requests   : {} total ({} ok, {} errors, {} cold starts)",
+            obs_stats.total_requests,
+            obs_stats.succeeded_requests,
+            obs_stats.failed_requests,
+            obs_stats.cold_starts
+        );
+        println!(
+            "  Latency (P50/P95) : {:.2} ms / {:.2} ms (run 'omk stats' for detailed breakdown)",
+            all_lat.p50_ms, all_lat.p95_ms
+        );
+        println!();
         println!("[AI Agent Harnesses]");
         for h in &harnesses {
             let det_str = if h.detected { "Detected" } else { "Not Found" };
@@ -567,6 +692,309 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
     Ok(())
 }
 
+fn round_f64(val: f64) -> f64 {
+    (val * 1000.0).round() / 1000.0
+}
+
+fn run_stats_command(
+    vault_dir: &Path,
+    last_n: Option<usize>,
+    slow_threshold_ms: f64,
+    reset: bool,
+    json_output: bool,
+) -> Result<(), OmkError> {
+    let paths = DaemonPaths::inspect(vault_dir);
+    if reset {
+        let removed = reset_telemetry_logs(&paths);
+        if json_output {
+            println!(
+                r#"{{"status":"reset","removed_files":{}}}"#,
+                removed
+            );
+        } else {
+            println!(
+                "omk v{} - Telemetry Logs Reset Complete (removed {} log file(s)).",
+                VERSION, removed
+            );
+        }
+        return Ok(());
+    }
+
+    let report = compute_telemetry_stats(&paths, last_n, slow_threshold_ms);
+    if json_output {
+        println!("{}", format_stats_json(&report));
+    } else {
+        print!("{}", format_stats_human(&paths, &report, slow_threshold_ms));
+    }
+    Ok(())
+}
+
+fn format_stats_json(report: &TelemetryStatsReport) -> String {
+    let mut err_map = BTreeMap::new();
+    for (code, cnt) in &report.error_counts {
+        err_map.insert(code.to_string(), JsonValue::Number(*cnt as f64));
+    }
+
+    let mut overview = BTreeMap::new();
+    overview.insert(
+        "total_requests".to_string(),
+        JsonValue::Number(report.total_requests as f64),
+    );
+    overview.insert(
+        "succeeded_requests".to_string(),
+        JsonValue::Number(report.succeeded_requests as f64),
+    );
+    overview.insert(
+        "failed_requests".to_string(),
+        JsonValue::Number(report.failed_requests as f64),
+    );
+    overview.insert("error_counts".to_string(), JsonValue::Object(err_map));
+    overview.insert(
+        "daemon_starts".to_string(),
+        JsonValue::Number(report.daemon_starts as f64),
+    );
+    overview.insert(
+        "cold_starts".to_string(),
+        JsonValue::Number(report.cold_starts as f64),
+    );
+    overview.insert(
+        "backpressure_rejections".to_string(),
+        JsonValue::Number(report.backpressure_rejections as f64),
+    );
+    overview.insert(
+        "startup_reconciles".to_string(),
+        JsonValue::Number(report.startup_reconciles as f64),
+    );
+    overview.insert(
+        "startup_reconcile_avg_ms".to_string(),
+        JsonValue::Number(round_f64(report.startup_reconcile_avg_ms)),
+    );
+    overview.insert(
+        "startup_reconcile_max_ms".to_string(),
+        JsonValue::Number(round_f64(report.startup_reconcile_max_ms)),
+    );
+
+    let mut latency_obj = BTreeMap::new();
+    for (tool, dist) in &report.latency_by_tool {
+        let mut d = BTreeMap::new();
+        d.insert("count".to_string(), JsonValue::Number(dist.count as f64));
+        d.insert("avg_ms".to_string(), JsonValue::Number(round_f64(dist.avg_ms)));
+        d.insert("p50_ms".to_string(), JsonValue::Number(round_f64(dist.p50_ms)));
+        d.insert("p95_ms".to_string(), JsonValue::Number(round_f64(dist.p95_ms)));
+        d.insert("p99_ms".to_string(), JsonValue::Number(round_f64(dist.p99_ms)));
+        d.insert("max_ms".to_string(), JsonValue::Number(round_f64(dist.max_ms)));
+        latency_obj.insert(tool.clone(), JsonValue::Object(d));
+    }
+
+    let mut attr_obj = BTreeMap::new();
+    for (tool, stages) in &report.stage_attribution {
+        let arr: Vec<JsonValue> = stages
+            .iter()
+            .map(|s| {
+                let mut m = BTreeMap::new();
+                m.insert("stage".to_string(), JsonValue::Str(s.stage.clone()));
+                m.insert("avg_ms".to_string(), JsonValue::Number(round_f64(s.avg_ms)));
+                m.insert(
+                    "share_pct".to_string(),
+                    JsonValue::Number(round_f64(s.share_pct)),
+                );
+                JsonValue::Object(m)
+            })
+            .collect();
+        attr_obj.insert(tool.clone(), JsonValue::Array(arr));
+    }
+
+    let mut eff_obj = BTreeMap::new();
+    eff_obj.insert(
+        "total_searches".to_string(),
+        JsonValue::Number(report.total_searches as f64),
+    );
+    eff_obj.insert(
+        "zero_hit_searches".to_string(),
+        JsonValue::Number(report.zero_hit_searches as f64),
+    );
+    eff_obj.insert(
+        "zero_hit_rate_pct".to_string(),
+        JsonValue::Number(round_f64(report.zero_hit_rate_pct)),
+    );
+    eff_obj.insert(
+        "avg_search_results".to_string(),
+        JsonValue::Number(round_f64(report.avg_search_results)),
+    );
+    eff_obj.insert(
+        "repeated_query_churn".to_string(),
+        JsonValue::Number(report.repeated_query_churn as f64),
+    );
+    eff_obj.insert(
+        "req_bytes_avg".to_string(),
+        JsonValue::Number(round_f64(report.req_bytes_avg)),
+    );
+    eff_obj.insert(
+        "resp_bytes_avg".to_string(),
+        JsonValue::Number(round_f64(report.resp_bytes_avg)),
+    );
+    eff_obj.insert(
+        "tokens_avg".to_string(),
+        JsonValue::Number(round_f64(report.tokens_avg)),
+    );
+    eff_obj.insert(
+        "tokens_p95".to_string(),
+        JsonValue::Number(report.tokens_p95 as f64),
+    );
+    eff_obj.insert(
+        "tokens_max".to_string(),
+        JsonValue::Number(report.tokens_max as f64),
+    );
+
+    let slow_arr: Vec<JsonValue> = report
+        .slow_requests
+        .iter()
+        .map(|s| {
+            let mut m = BTreeMap::new();
+            m.insert("timestamp".to_string(), JsonValue::Str(s.timestamp.clone()));
+            m.insert("trace_id".to_string(), JsonValue::Str(s.trace_id.clone()));
+            m.insert("operation".to_string(), JsonValue::Str(s.operation.clone()));
+            m.insert(
+                "total_ms".to_string(),
+                JsonValue::Number(round_f64(s.total_ms)),
+            );
+            m.insert(
+                "dominant_span".to_string(),
+                JsonValue::Str(s.dominant_span.clone()),
+            );
+            m.insert(
+                "target_ref".to_string(),
+                JsonValue::Str(s.target_ref.clone()),
+            );
+            JsonValue::Object(m)
+        })
+        .collect();
+
+    let mut root = BTreeMap::new();
+    root.insert("status".to_string(), JsonValue::Str("ok".to_string()));
+    root.insert("overview".to_string(), JsonValue::Object(overview));
+    root.insert("latency_ms".to_string(), JsonValue::Object(latency_obj));
+    root.insert("stage_attribution".to_string(), JsonValue::Object(attr_obj));
+    root.insert("agent_efficiency".to_string(), JsonValue::Object(eff_obj));
+    root.insert("slow_requests".to_string(), JsonValue::Array(slow_arr));
+    JsonValue::Object(root).to_json_string()
+}
+
+fn format_stats_human(
+    paths: &DaemonPaths,
+    report: &TelemetryStatsReport,
+    slow_threshold_ms: f64,
+) -> String {
+    let mut out = String::new();
+    let home = std::env::var("HOME").ok();
+    let vault_str = paths.vault_dir.to_string_lossy().into_owned();
+    let safe_log_path = sanitize_system_path(
+        &paths.log_path.to_string_lossy(),
+        Some(&vault_str),
+        home.as_deref(),
+    );
+
+    out.push_str(&format!(
+        "omk v{} - Execution Observability & Performance Diagnostics (Privacy-Preserving)\n",
+        VERSION
+    ));
+    out.push_str("===============================================================================\n");
+    out.push_str(&format!("  Telemetry Source  : {}\n\n", safe_log_path));
+
+    // Section 1: Overview & Lifecycle Summary
+    out.push_str("[1. Overview & Lifecycle Summary]\n");
+    out.push_str(&format!(
+        "  Total RPC Requests    : {} ({} succeeded, {} failed)\n",
+        report.total_requests, report.succeeded_requests, report.failed_requests
+    ));
+    out.push_str(&format!(
+        "  Daemon Lifecycle      : {} starts | {} cold starts (auto-spawn) | {} backpressure rejections\n",
+        report.daemon_starts, report.cold_starts, report.backpressure_rejections
+    ));
+    out.push_str(&format!(
+        "  Startup Reconcile     : {} runs (Avg: {:.2} ms, Max: {:.2} ms)\n",
+        report.startup_reconciles, report.startup_reconcile_avg_ms, report.startup_reconcile_max_ms
+    ));
+    if !report.error_counts.is_empty() {
+        let errs: Vec<String> = report
+            .error_counts
+            .iter()
+            .map(|(code, cnt)| format!("{}: {}", code, cnt))
+            .collect();
+        out.push_str(&format!("  Error Code Breakdown  : {}\n", errs.join(", ")));
+    }
+    out.push('\n');
+
+    // Section 2: Tool Latency Breakdown
+    out.push_str("[2. Tool Latency Breakdown (ms)]\n");
+    out.push_str("  Tool               Count     Avg ms     P50 ms     P95 ms     P99 ms     Max ms\n");
+    out.push_str("  -------------------------------------------------------------------------------\n");
+    for key in [
+        "all",
+        "search_knowledge",
+        "upsert_knowledge",
+        "read_knowledge",
+        "reconcile",
+    ] {
+        let d = report.latency_by_tool.get(key).cloned().unwrap_or_default();
+        out.push_str(&format!(
+            "  {:<18} {:>5} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}\n",
+            key, d.count, d.avg_ms, d.p50_ms, d.p95_ms, d.p99_ms, d.max_ms
+        ));
+    }
+    out.push('\n');
+
+    // Section 3: Stage Bottleneck Attribution
+    out.push_str("[3. Stage Bottleneck Attribution]\n");
+    for key in ["upsert_knowledge", "search_knowledge", "read_knowledge"] {
+        if let Some(stages) = report.stage_attribution.get(key) {
+            let parts: Vec<String> = stages
+                .iter()
+                .map(|s| format!("{}: {:.2}ms ({:.1}%)", s.stage, s.avg_ms, s.share_pct))
+                .collect();
+            out.push_str(&format!("  * {:<17} -> {}\n", key, parts.join(" | ")));
+        }
+    }
+    out.push('\n');
+
+    // Section 4: Agent Efficiency & Search Quality
+    out.push_str("[4. Agent Efficiency & Search Quality]\n");
+    out.push_str(&format!(
+        "  Search Zero-Hit Rate  : {:.1}% ({} / {} searches returned 0 matches)\n",
+        report.zero_hit_rate_pct, report.zero_hit_searches, report.total_searches
+    ));
+    out.push_str(&format!(
+        "  Avg Search Matches    : {:.2} results/search | Repeated Query Churn: {}\n",
+        report.avg_search_results, report.repeated_query_churn
+    ));
+    out.push_str(&format!(
+        "  Payload & Tokens      : Req Avg {:.0} B | Resp Avg {:.0} B | Tokens Avg {:.1} / P95 {} / Max {}\n\n",
+        report.req_bytes_avg,
+        report.resp_bytes_avg,
+        report.tokens_avg,
+        report.tokens_p95,
+        report.tokens_max
+    ));
+
+    // Section 5: Slow Request Anomalies
+    out.push_str(&format!(
+        "[5. Slow Request Anomalies (Threshold >= {:.1} ms)]\n",
+        slow_threshold_ms
+    ));
+    if report.slow_requests.is_empty() {
+        out.push_str("  None (all observed requests completed below threshold).\n");
+    } else {
+        for s in &report.slow_requests {
+            out.push_str(&format!(
+                "  - [{}] {:<16} {:>7.2} ms | Dominant: {:<22} | Ref: {}\n",
+                s.timestamp, s.operation, s.total_ms, s.dominant_span, s.target_ref
+            ));
+        }
+    }
+
+    out
+}
+
 fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
     match opts.subcommand {
         Subcommand::Version => {
@@ -580,7 +1008,7 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
         Subcommand::Help => {
             if opts.json_output {
                 println!(
-                    r#"{{"name":"omk","version":"{}","commands":["install","status","reconcile","stop","mcp","daemon","help"]}}"#,
+                    r#"{{"name":"omk","version":"{}","commands":["install","status","stats","reconcile","stop","mcp","daemon","help"]}}"#,
                     VERSION
                 );
             } else {
@@ -642,6 +1070,13 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
             Ok(())
         }
         Subcommand::Status => run_status_command(&opts.vault_dir, opts.json_output),
+        Subcommand::Stats => run_stats_command(
+            &opts.vault_dir,
+            opts.last_n,
+            opts.slow_threshold_ms,
+            opts.reset_stats,
+            opts.json_output,
+        ),
         Subcommand::Reconcile => {
             let paths = DaemonPaths::resolve(&opts.vault_dir)?;
             let doc_store = Arc::new(LocalMarkdownDocumentStore::new(&paths.vault_dir)?);
@@ -770,6 +1205,24 @@ mod tests {
         let opts = parse_cli_args_from(&args, true).expect("valid install args");
         assert_eq!(opts.subcommand, Subcommand::Install);
         assert_eq!(opts.harness_spec.as_deref(), Some("claude-code,cursor"));
+        assert!(opts.json_output);
+    }
+
+    #[test]
+    fn test_cli_parser_accepts_stats_and_options() {
+        let args = vec![
+            "stats".to_string(),
+            "--last".to_string(),
+            "25".to_string(),
+            "--slow-ms=12.5".to_string(),
+            "--reset".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_cli_args_from(&args, true).expect("valid stats args");
+        assert_eq!(opts.subcommand, Subcommand::Stats);
+        assert_eq!(opts.last_n, Some(25));
+        assert_eq!(opts.slow_threshold_ms, 12.5);
+        assert!(opts.reset_stats);
         assert!(opts.json_output);
     }
 }

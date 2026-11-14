@@ -239,6 +239,16 @@ impl KnowledgeEntity {
         (secs, format_unix_iso8601(secs))
     }
 
+    /// Generates a current Unix epoch timestamp in milliseconds and an ISO-8601 UTC string
+    /// with millisecond resolution (`YYYY-MM-DDTHH:MM:SS.mmmZ`, `REQ-OBS-001`).
+    pub fn current_timestamps_ms() -> (i64, String) {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        (ms, format_unix_iso8601_ms(ms))
+    }
+
     /// Serializes the dynamic business metadata of this entity into a JSON object string
     /// for storage in the SQLite `metadata` JSON column (`EPIC-DATA-01`).
     pub fn metadata_json(&self) -> String {
@@ -300,6 +310,16 @@ pub fn format_unix_iso8601(secs: i64) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, m, d, hour, minute, second
     )
+}
+
+/// Converts Unix timestamp milliseconds into an ISO-8601 UTC string with millisecond resolution
+/// (`YYYY-MM-DDTHH:MM:SS.mmmZ`, `REQ-OBS-001`).
+pub fn format_unix_iso8601_ms(epoch_ms: i64) -> String {
+    let secs = epoch_ms.div_euclid(1000);
+    let millis = epoch_ms.rem_euclid(1000);
+    let base = format_unix_iso8601(secs);
+    let stem = base.strip_suffix('Z').unwrap_or(&base);
+    format!("{}.{:03}Z", stem, millis)
 }
 
 /// Command DTO for creating or updating knowledge (`upsert_knowledge`).
@@ -448,6 +468,234 @@ impl OmkError {
             | Self::NotFound(m) => m,
         }
     }
+
+    /// Returns a privacy-safe canonical error kind identifier free of any user input (`REQ-OBS-003`).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::ParseError(_) => "ParseError",
+            Self::InvalidRequest(_) => "InvalidRequest",
+            Self::MethodNotFound(_) => "MethodNotFound",
+            Self::InvalidParams(_) => "InvalidParams",
+            Self::InternalError(_) => "InternalError",
+            Self::DaemonUnreachable(_) => "DaemonUnreachable",
+            Self::ServerBusy(_) => "ServerBusy",
+            Self::AuthorityViolation(_) => "AuthorityViolation",
+            Self::AccessDenied(_) => "AccessDenied",
+            Self::NotFound(_) => "NotFound",
+        }
+    }
+}
+
+/// Microsecond-level Span timings for `upsert_knowledge` (`REQ-OBS-001`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertTimings {
+    /// Time spent validating parameters, checking existing document, and verifying authority (`us`).
+    pub validate_read_us: u64,
+    /// Time spent rendering Markdown, writing the temporary file, and renaming (`us`).
+    pub vault_write_us: u64,
+    /// Time spent calling `fsync` (`sync_all`) on the temporary Vault file (`us`).
+    pub vault_fsync_us: u64,
+    /// Time spent updating the SQLite `knowledge_index` and `knowledge_fts` tables (`us`).
+    pub index_write_us: u64,
+    /// Total pipeline duration for the upsert operation (`us`).
+    pub total_us: u64,
+}
+
+/// Quantitative non-PII metrics for `upsert_knowledge` (`REQ-OBS-002`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertMetrics {
+    /// Final resolved document ID (must be hashed via [`salted_doc_ref`] before logging unless unredacted).
+    pub raw_doc_id: String,
+    /// `"created"` or `"updated"`.
+    pub upsert_status: String,
+    /// Canonical `SourceClass` string.
+    pub source_class: String,
+    /// Canonical `SourceType` string.
+    pub source_type: String,
+    /// Canonical `SyncStrategy` string.
+    pub sync_strategy: String,
+    /// Number of tags on the resulting document.
+    pub tag_count: usize,
+    /// UTF-8 byte length of the stored Markdown body.
+    pub content_bytes: usize,
+    /// Estimated LLM token count (`ceil(content_bytes / 4)`).
+    pub estimated_tokens: usize,
+}
+
+/// Microsecond-level Span timings for `search_knowledge` (`REQ-OBS-001`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchTimings {
+    /// Time spent parsing and sanitizing the FTS5 query expression (`us`).
+    pub fts_build_us: u64,
+    /// Time spent opening the concurrent SQLite reader connection and setting PRAGMAs (`us`).
+    pub db_open_us: u64,
+    /// Time spent preparing and stepping SQLite FTS5 / index statements (`us`).
+    pub fts_query_us: u64,
+    /// Time spent parsing row metadata JSON, applying filters, and building snippets (`us`).
+    pub filter_post_us: u64,
+    /// Total pipeline duration for the search operation (`us`).
+    pub total_us: u64,
+}
+
+/// Quantitative non-PII metrics for `search_knowledge` (`REQ-OBS-002`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMetrics {
+    /// Raw query string if provided (must be hashed via [`salted_query_ref`] before logging).
+    pub raw_query: Option<String>,
+    /// Whether a non-empty search query was provided.
+    pub query_present: bool,
+    /// Number of whitespace-separated query tokens.
+    pub query_token_count: usize,
+    /// Whether the query explicitly included `AND` or `OR` boolean operators.
+    pub query_has_boolean_op: bool,
+    /// Number of filter tags specified.
+    pub filter_tag_count: usize,
+    /// Whether a `source_class` filter was specified.
+    pub has_source_class_filter: bool,
+    /// Whether a `source_type` filter was specified.
+    pub has_source_type_filter: bool,
+    /// Whether a `min_authority` filter was specified.
+    pub has_min_authority_filter: bool,
+    /// Requested `limit` parameter.
+    pub requested_limit: u32,
+    /// Number of matched documents returned.
+    pub result_count: usize,
+    /// `true` if `result_count == 0`.
+    pub zero_hit: bool,
+    /// Total UTF-8 byte length across all returned snippets.
+    pub content_bytes: usize,
+    /// Estimated LLM token count across all returned snippets.
+    pub estimated_tokens: usize,
+}
+
+/// Microsecond-level Span timings for `read_knowledge` (`REQ-OBS-001`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadTimings {
+    /// Time spent reading the `.md` file from disk (`us`).
+    pub vault_read_us: u64,
+    /// Time spent parsing YAML Frontmatter and Markdown body (`us`).
+    pub markdown_parse_us: u64,
+    /// Total pipeline duration for the read operation (`us`).
+    pub total_us: u64,
+}
+
+/// Quantitative non-PII metrics for `read_knowledge` (`REQ-OBS-002`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadMetrics {
+    /// Requested document ID (must be hashed via [`salted_doc_ref`] before logging).
+    pub raw_doc_id: String,
+    /// Whether the document was found.
+    pub found: bool,
+    /// Number of tags on the document.
+    pub tag_count: usize,
+    /// Canonical `SourceClass` string.
+    pub source_class: String,
+    /// Canonical `SourceType` string.
+    pub source_type: String,
+    /// UTF-8 byte length of the document body.
+    pub content_bytes: usize,
+    /// Estimated LLM token count (`ceil(content_bytes / 4)`).
+    pub estimated_tokens: usize,
+}
+
+/// Microsecond-level Span timings for `reconcile` (`REQ-OBS-001`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileTimings {
+    /// Time spent scanning and parsing all `.md` files in the Vault (`us`).
+    pub vault_scan_us: u64,
+    /// Time spent querying existing `version_hash` entries from SQLite (`us`).
+    pub index_hash_scan_us: u64,
+    /// Time spent re-indexing missing or stale documents (`us`).
+    pub reindex_write_us: u64,
+    /// Time spent deleting orphaned index entries (`us`).
+    pub orphan_prune_us: u64,
+    /// Total reconciliation duration (`us`).
+    pub total_us: u64,
+}
+
+/// Estimates the LLM token count from a UTF-8 byte length (`ceil(bytes / 4)`, `REQ-OBS-002`).
+pub fn estimate_tokens(byte_len: usize) -> usize {
+    if byte_len == 0 {
+        0
+    } else {
+        (byte_len + 3) / 4
+    }
+}
+
+/// Computes a deterministic, salted one-way hash reference (`doc#<16-hex>`) for a document ID
+/// so correlation analysis can be performed without exposing raw IDs or titles (`REQ-OBS-003`).
+pub fn salted_doc_ref(salt: u64, doc_id: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325 ^ salt. rotate_left(17);
+    for b in b"omk:doc:" {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in doc_id.trim().as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= salt;
+    hash = hash.wrapping_mul(0x100000001b3);
+    format!("doc#{:016x}", hash)
+}
+
+/// Computes a deterministic, salted one-way hash reference (`qry#<16-hex>`) for a search query
+/// after normalizing whitespace and ASCII case (`REQ-OBS-003`).
+pub fn salted_query_ref(salt: u64, raw_query: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325 ^ salt.rotate_right(13);
+    for b in b"omk:qry:" {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mut first = true;
+    for tok in raw_query.split_whitespace() {
+        if !first {
+            hash ^= u64::from(b' ');
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for b in tok.bytes() {
+            hash ^= u64::from(b.to_ascii_lowercase());
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        first = false;
+    }
+    hash ^= salt;
+    hash = hash.wrapping_mul(0x100000001b3);
+    format!("qry#{:016x}", hash)
+}
+
+/// Sanitizes file system paths inside log strings by replacing the Vault path with `<VAULT>`,
+/// the home directory path with `<HOME>`, and any `/Users/<username>` or `/home/<username>`
+/// prefix with `<HOME>` (`REQ-OBS-003`).
+pub fn sanitize_system_path(raw: &str, vault_dir: Option<&str>, home_dir: Option<&str>) -> String {
+    let mut out = raw.to_string();
+    if let Some(v) = vault_dir {
+        let trimmed = v.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            out = out.replace(trimmed, "<VAULT>");
+        }
+    }
+    if let Some(h) = home_dir {
+        let trimmed = h.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            out = out.replace(trimmed, "<HOME>");
+        }
+    }
+    for prefix in ["/Users/", "/home/"] {
+        while let Some(idx) = out.find(prefix) {
+            let after_prefix = idx + prefix.len();
+            let rest = &out[after_prefix..];
+            let user_len = rest
+                .find(|c: char| c == '/' || c == '"' || c == '\'' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            if user_len == 0 {
+                break;
+            }
+            let end_idx = after_prefix + user_len;
+            out.replace_range(idx..end_idx, "<HOME>");
+        }
+    }
+    out
 }
 
 impl fmt::Display for OmkError {
@@ -918,5 +1166,35 @@ mod tests {
         let serialized = parsed.to_json_string();
         let reparsed = JsonValue::parse(&serialized).expect("reparsed");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn test_privacy_salted_hashing_and_path_sanitization() {
+        let salt = 0x1234_5678_9abc_def0;
+        let d1 = salted_doc_ref(salt, "secret-project-alpha");
+        let d2 = salted_doc_ref(salt, "secret-project-alpha");
+        let d3 = salted_doc_ref(salt ^ 1, "secret-project-alpha");
+        assert!(d1.starts_with("doc#"));
+        assert_eq!(d1.len(), 20);
+        assert_eq!(d1, d2);
+        assert_ne!(d1, d3);
+        assert!(!d1.contains("secret"));
+
+        let q1 = salted_query_ref(salt, "  Sensitive   Token  ");
+        let q2 = salted_query_ref(salt, "sensitive token");
+        assert!(q1.starts_with("qry#"));
+        assert_eq!(q1, q2);
+        assert!(!q1.contains("sensitive"));
+
+        let raw_msg = "socket=/Users/alice/.omk/vault/.omk/daemon.sock home=/home/bob/work";
+        let clean = sanitize_system_path(
+            raw_msg,
+            Some("/Users/alice/.omk/vault"),
+            Some("/Users/alice"),
+        );
+        assert!(!clean.contains("alice"));
+        assert!(!clean.contains("bob"));
+        assert!(clean.contains("<VAULT>/.omk/daemon.sock"));
+        assert!(clean.contains("<HOME>/work"));
     }
 }

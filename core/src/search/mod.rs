@@ -7,13 +7,15 @@
 //! - [`ReconcileReport`] / [`KnowledgePipeline::reconcile`] (Startup Auto-Recovery / `fsck`)
 
 use crate::domain::{
-    KnowledgeEntity, OmkError, SearchQuery, SearchResultSnippet, SourceClass, SourceProvenance,
-    SyncMetadata, SyncStrategy, UpsertCommand, UpsertResult,
+    estimate_tokens, KnowledgeEntity, OmkError, ReadMetrics, ReadTimings, ReconcileTimings,
+    SearchMetrics, SearchQuery, SearchResultSnippet, SearchTimings, SourceClass, SourceProvenance,
+    SyncMetadata, SyncStrategy, UpsertCommand, UpsertMetrics, UpsertResult, UpsertTimings,
 };
 use crate::index::IndexStore;
 use crate::vault::{DocumentStore, LocalMarkdownDocumentStore};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Summary report produced by startup or manual Vault-Index reconciliation (`fsck`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,22 @@ impl KnowledgePipeline {
     /// - [`OmkError::AccessDenied`] if the document ID attempts path traversal.
     /// - [`OmkError::InternalError`] on storage or index failure.
     pub fn upsert_knowledge(&self, cmd: UpsertCommand) -> Result<UpsertResult, OmkError> {
+        let (res, _, _) = self.upsert_knowledge_timed(cmd)?;
+        Ok(res)
+    }
+
+    /// Executes the Command Pipeline (`upsert_knowledge`) and returns the result alongside
+    /// microsecond-level [`UpsertTimings`] and quantitative [`UpsertMetrics`] (`REQ-OBS-001`, `REQ-OBS-002`).
+    ///
+    /// # Errors
+    /// Returns the same errors as [`KnowledgePipeline::upsert_knowledge`].
+    pub fn upsert_knowledge_timed(
+        &self,
+        cmd: UpsertCommand,
+    ) -> Result<(UpsertResult, UpsertTimings, UpsertMetrics), OmkError> {
+        let total_start = Instant::now();
+        let val_start = Instant::now();
+
         let title = cmd.title.trim().to_string();
         if title.is_empty() {
             return Err(OmkError::InvalidParams(
@@ -187,6 +205,9 @@ impl KnowledgePipeline {
             final_state.as_deref(),
         );
 
+        let content_bytes = final_content.len();
+        let tag_count = final_tags.len();
+
         let entity = KnowledgeEntity {
             id: doc_id.clone(),
             title,
@@ -213,17 +234,44 @@ impl KnowledgePipeline {
             created_at: now_secs,
             content: final_content,
         };
+        let validate_read_us = val_start.elapsed().as_micros() as u64;
 
         // 3. Vault Writer (SSOT) -> 4. Indexer (IndexStore)
-        let file_path = self.doc_store.put_document(&entity)?;
+        let (file_path, vault_write_us, vault_fsync_us) =
+            self.doc_store.put_document_timed(&entity)?;
+        let idx_start = Instant::now();
         self.index_store.upsert_index(&entity)?;
+        let index_write_us = idx_start.elapsed().as_micros() as u64;
+        let total_us = total_start.elapsed().as_micros() as u64;
 
-        Ok(UpsertResult {
-            id: doc_id,
-            status: status_str.to_string(),
-            version_hash,
-            file_path,
-        })
+        let timings = UpsertTimings {
+            validate_read_us,
+            vault_write_us,
+            vault_fsync_us,
+            index_write_us,
+            total_us,
+        };
+        let metrics = UpsertMetrics {
+            raw_doc_id: doc_id.clone(),
+            upsert_status: status_str.to_string(),
+            source_class: cmd.source_class.as_str().to_string(),
+            source_type: cmd.source_type.as_str().to_string(),
+            sync_strategy: strategy.as_str().to_string(),
+            tag_count,
+            content_bytes,
+            estimated_tokens: estimate_tokens(content_bytes),
+        };
+
+        Ok((
+            UpsertResult {
+                id: doc_id,
+                status: status_str.to_string(),
+                version_hash,
+                file_path,
+            },
+            timings,
+            metrics,
+        ))
     }
 
     /// Executes the Query Pipeline (`search_knowledge`): queries only [`IndexStore`] without touching
@@ -235,8 +283,56 @@ impl KnowledgePipeline {
         &self,
         query: SearchQuery,
     ) -> Result<Vec<SearchResultSnippet>, OmkError> {
-        self.index_store
-            .search(query.query.as_deref(), &query.filters, query.limit)
+        let (hits, _, _) = self.search_knowledge_timed(query)?;
+        Ok(hits)
+    }
+
+    /// Executes the Query Pipeline (`search_knowledge`) and returns matched snippets alongside
+    /// [`SearchTimings`] and [`SearchMetrics`] (`REQ-OBS-001`, `REQ-OBS-002`).
+    ///
+    /// # Errors
+    /// Returns [`OmkError::InternalError`] if querying the index fails.
+    pub fn search_knowledge_timed(
+        &self,
+        query: SearchQuery,
+    ) -> Result<(Vec<SearchResultSnippet>, SearchTimings, SearchMetrics), OmkError> {
+        let raw_q = query.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let query_present = raw_q.is_some();
+        let mut query_token_count = 0usize;
+        let mut query_has_boolean_op = false;
+        if let Some(q_str) = raw_q {
+            for tok in q_str.split_whitespace() {
+                if tok.eq_ignore_ascii_case("AND") || tok.eq_ignore_ascii_case("OR") {
+                    query_has_boolean_op = true;
+                } else {
+                    query_token_count += 1;
+                }
+            }
+        }
+
+        let (matches, timings) = self
+            .index_store
+            .search_timed(query.query.as_deref(), &query.filters, query.limit)?;
+
+        let content_bytes: usize = matches.iter().map(|m| m.snippet.len() + m.title.len()).sum();
+        let result_count = matches.len();
+        let metrics = SearchMetrics {
+            raw_query: raw_q.map(ToString::to_string),
+            query_present,
+            query_token_count,
+            query_has_boolean_op,
+            filter_tag_count: query.filters.tags.len(),
+            has_source_class_filter: query.filters.source_class.is_some(),
+            has_source_type_filter: query.filters.source_type.is_some(),
+            has_min_authority_filter: query.filters.min_authority.is_some(),
+            requested_limit: query.limit,
+            result_count,
+            zero_hit: result_count == 0,
+            content_bytes,
+            estimated_tokens: estimate_tokens(content_bytes),
+        };
+
+        Ok((matches, timings, metrics))
     }
 
     /// Executes the single-document Query Pipeline (`read_knowledge`): retrieves the full
@@ -246,7 +342,39 @@ impl KnowledgePipeline {
     /// Returns [`OmkError::NotFound`] if the document does not exist or [`OmkError::AccessDenied`]
     /// if the ID attempts path traversal.
     pub fn read_knowledge(&self, id: &str) -> Result<KnowledgeEntity, OmkError> {
-        self.doc_store.get_document(id)
+        let (doc, _, _) = self.read_knowledge_timed(id)?;
+        Ok(doc)
+    }
+
+    /// Executes the single-document Query Pipeline (`read_knowledge`) and returns the entity
+    /// alongside [`ReadTimings`] and [`ReadMetrics`] (`REQ-OBS-001`, `REQ-OBS-002`).
+    ///
+    /// # Errors
+    /// Returns [`OmkError::NotFound`] if the document does not exist or [`OmkError::AccessDenied`]
+    /// if the ID attempts path traversal.
+    pub fn read_knowledge_timed(
+        &self,
+        id: &str,
+    ) -> Result<(KnowledgeEntity, ReadTimings, ReadMetrics), OmkError> {
+        let total_start = Instant::now();
+        let (entity, vault_read_us, markdown_parse_us) = self.doc_store.get_document_timed(id)?;
+        let total_us = total_start.elapsed().as_micros() as u64;
+        let content_bytes = entity.content.len();
+        let timings = ReadTimings {
+            vault_read_us,
+            markdown_parse_us,
+            total_us,
+        };
+        let metrics = ReadMetrics {
+            raw_doc_id: entity.id.clone(),
+            found: true,
+            tag_count: entity.tags.len(),
+            source_class: entity.source.class.as_str().to_string(),
+            source_type: entity.source.source_type.as_str().to_string(),
+            content_bytes,
+            estimated_tokens: estimate_tokens(content_bytes),
+        };
+        Ok((entity, timings, metrics))
     }
 
     /// Reconciles the [`DocumentStore`] (SSOT) and [`IndexStore`] by comparing `version_hash` values,
@@ -255,9 +383,27 @@ impl KnowledgePipeline {
     /// # Errors
     /// Returns [`OmkError::InternalError`] if reading the Vault or updating the index fails.
     pub fn reconcile(&self) -> Result<ReconcileReport, OmkError> {
-        let vault_docs = self.doc_store.list_documents()?;
-        let index_hashes = self.index_store.list_index_hashes()?;
+        let (rep, _) = self.reconcile_timed()?;
+        Ok(rep)
+    }
 
+    /// Reconciles the [`DocumentStore`] and [`IndexStore`] and returns both the [`ReconcileReport`]
+    /// and microsecond-level [`ReconcileTimings`] (`REQ-OBS-001`).
+    ///
+    /// # Errors
+    /// Returns [`OmkError::InternalError`] if reading the Vault or updating the index fails.
+    pub fn reconcile_timed(&self) -> Result<(ReconcileReport, ReconcileTimings), OmkError> {
+        let total_start = Instant::now();
+
+        let scan_start = Instant::now();
+        let vault_docs = self.doc_store.list_documents()?;
+        let vault_scan_us = scan_start.elapsed().as_micros() as u64;
+
+        let hash_start = Instant::now();
+        let index_hashes = self.index_store.list_index_hashes()?;
+        let index_hash_scan_us = hash_start.elapsed().as_micros() as u64;
+
+        let reindex_start = Instant::now();
         let mut seen_ids = BTreeSet::new();
         let mut reindexed_count = 0usize;
 
@@ -272,7 +418,9 @@ impl KnowledgePipeline {
                 reindexed_count += 1;
             }
         }
+        let reindex_write_us = reindex_start.elapsed().as_micros() as u64;
 
+        let prune_start = Instant::now();
         let mut removed_orphans_count = 0usize;
         for indexed_id in index_hashes.keys() {
             if !seen_ids.contains(indexed_id) {
@@ -280,12 +428,23 @@ impl KnowledgePipeline {
                 removed_orphans_count += 1;
             }
         }
+        let orphan_prune_us = prune_start.elapsed().as_micros() as u64;
+        let total_us = total_start.elapsed().as_micros() as u64;
 
-        Ok(ReconcileReport {
-            scanned_documents: vault_docs.len(),
-            reindexed_count,
-            removed_orphans_count,
-        })
+        Ok((
+            ReconcileReport {
+                scanned_documents: vault_docs.len(),
+                reindexed_count,
+                removed_orphans_count,
+            },
+            ReconcileTimings {
+                vault_scan_us,
+                index_hash_scan_us,
+                reindex_write_us,
+                orphan_prune_us,
+                total_us,
+            },
+        ))
     }
 }
 

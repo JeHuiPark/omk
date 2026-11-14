@@ -11,6 +11,7 @@ use crate::domain::{
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Storage abstraction for the Single Source of Truth (SSOT) Markdown Vault (`docs/architecture.md` §5.1).
 pub trait DocumentStore: Send + Sync {
@@ -21,12 +22,34 @@ pub trait DocumentStore: Send + Sync {
     /// [`OmkError::InternalError`] on file system failure.
     fn put_document(&self, entity: &KnowledgeEntity) -> Result<String, OmkError>;
 
+    /// Persists a [`KnowledgeEntity`] and returns `(relative_path, vault_write_us, vault_fsync_us)`
+    /// (`REQ-OBS-001`).
+    ///
+    /// # Errors
+    /// Returns the same errors as [`DocumentStore::put_document`].
+    fn put_document_timed(&self, entity: &KnowledgeEntity) -> Result<(String, u64, u64), OmkError> {
+        let start = Instant::now();
+        let rel = self.put_document(entity)?;
+        Ok((rel, start.elapsed().as_micros() as u64, 0))
+    }
+
     /// Loads a [`KnowledgeEntity`] by its document ID.
     ///
     /// # Errors
     /// Returns [`OmkError::NotFound`] if the document does not exist, [`OmkError::AccessDenied`]
     /// if the ID is unsafe, or [`OmkError::InternalError`] on I/O failure.
     fn get_document(&self, id: &str) -> Result<KnowledgeEntity, OmkError>;
+
+    /// Loads a [`KnowledgeEntity`] by ID and returns `(entity, vault_read_us, markdown_parse_us)`
+    /// (`REQ-OBS-001`).
+    ///
+    /// # Errors
+    /// Returns the same errors as [`DocumentStore::get_document`].
+    fn get_document_timed(&self, id: &str) -> Result<(KnowledgeEntity, u64, u64), OmkError> {
+        let start = Instant::now();
+        let doc = self.get_document(id)?;
+        Ok((doc, start.elapsed().as_micros() as u64, 0))
+    }
 
     /// Deletes a document from the Vault by ID.
     ///
@@ -342,6 +365,12 @@ impl LocalMarkdownDocumentStore {
 
 impl DocumentStore for LocalMarkdownDocumentStore {
     fn put_document(&self, entity: &KnowledgeEntity) -> Result<String, OmkError> {
+        let (rel, _, _) = self.put_document_timed(entity)?;
+        Ok(rel)
+    }
+
+    fn put_document_timed(&self, entity: &KnowledgeEntity) -> Result<(String, u64, u64), OmkError> {
+        let write_start = Instant::now();
         let target_path = self.resolve_safe_path(&entity.id)?;
         let markdown = Self::render_markdown(entity);
 
@@ -353,6 +382,7 @@ impl DocumentStore for LocalMarkdownDocumentStore {
         );
         let tmp_path = self.root_dir.join(tmp_name);
 
+        let fsync_us: u64;
         {
             let mut file = File::create(&tmp_path).map_err(|e| {
                 OmkError::InternalError(format!(
@@ -368,6 +398,7 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                     e
                 ))
             })?;
+            let fsync_start = Instant::now();
             file.sync_all().map_err(|e| {
                 OmkError::InternalError(format!(
                     "Failed to fsync temporary Vault file '{}': {}",
@@ -375,6 +406,7 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                     e
                 ))
             })?;
+            fsync_us = fsync_start.elapsed().as_micros() as u64;
         }
 
         fs::rename(&tmp_path, &target_path).map_err(|e| {
@@ -385,11 +417,19 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                 e
             ))
         })?;
+        let total_vault_us = write_start.elapsed().as_micros() as u64;
+        let vault_write_us = total_vault_us.saturating_sub(fsync_us);
 
-        Ok(format!("{}.md", entity.id))
+        Ok((format!("{}.md", entity.id), vault_write_us, fsync_us))
     }
 
     fn get_document(&self, id: &str) -> Result<KnowledgeEntity, OmkError> {
+        let (doc, _, _) = self.get_document_timed(id)?;
+        Ok(doc)
+    }
+
+    fn get_document_timed(&self, id: &str) -> Result<(KnowledgeEntity, u64, u64), OmkError> {
+        let read_start = Instant::now();
         let target_path = self.resolve_safe_path(id)?;
         if !target_path.exists() {
             return Err(OmkError::NotFound(format!(
@@ -404,8 +444,14 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                 e
             ))
         })?;
+        let vault_read_us = read_start.elapsed().as_micros() as u64;
+
+        let parse_start = Instant::now();
         let clean_id = id.trim().strip_suffix(".md").unwrap_or(id.trim());
-        Self::parse_markdown(clean_id, &raw)
+        let entity = Self::parse_markdown(clean_id, &raw)?;
+        let markdown_parse_us = parse_start.elapsed().as_micros() as u64;
+
+        Ok((entity, vault_read_us, markdown_parse_us))
     }
 
     fn delete_document(&self, id: &str) -> Result<(), OmkError> {

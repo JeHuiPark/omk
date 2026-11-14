@@ -5,7 +5,7 @@
 //! with WAL mode enabled for concurrent read/write performance.
 
 use crate::domain::{
-    JsonValue, KnowledgeEntity, OmkError, SearchFilters, SearchResultSnippet,
+    JsonValue, KnowledgeEntity, OmkError, SearchFilters, SearchResultSnippet, SearchTimings,
 };
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -13,6 +13,7 @@ use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// Storage abstraction for full-text search and metadata indexing (`docs/architecture.md` §5.2).
 pub trait IndexStore: Send + Sync {
@@ -38,6 +39,32 @@ pub trait IndexStore: Send + Sync {
         filters: &SearchFilters,
         limit: u32,
     ) -> Result<Vec<SearchResultSnippet>, OmkError>;
+
+    /// Searches indexed knowledge and returns both matched snippets and microsecond-level
+    /// [`SearchTimings`] (`REQ-OBS-001`).
+    ///
+    /// # Errors
+    /// Returns the same errors as [`IndexStore::search`].
+    fn search_timed(
+        &self,
+        query: Option<&str>,
+        filters: &SearchFilters,
+        limit: u32,
+    ) -> Result<(Vec<SearchResultSnippet>, SearchTimings), OmkError> {
+        let start = Instant::now();
+        let hits = self.search(query, filters, limit)?;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        Ok((
+            hits,
+            SearchTimings {
+                fts_build_us: 0,
+                db_open_us: 0,
+                fts_query_us: elapsed_us,
+                filter_post_us: 0,
+                total_us: elapsed_us,
+            },
+        ))
+    }
 
     /// Returns a map of `id -> version_hash` for all indexed documents (used for startup reconciliation/`fsck`).
     ///
@@ -490,12 +517,30 @@ impl IndexStore for SqliteFtsIndexStore {
         filters: &SearchFilters,
         limit: u32,
     ) -> Result<Vec<SearchResultSnippet>, OmkError> {
-        let reader = self.open_reader()?;
+        let (results, _) = self.search_timed(query, filters, limit)?;
+        Ok(results)
+    }
+
+    fn search_timed(
+        &self,
+        query: Option<&str>,
+        filters: &SearchFilters,
+        limit: u32,
+    ) -> Result<(Vec<SearchResultSnippet>, SearchTimings), OmkError> {
+        let total_start = Instant::now();
+
+        let build_start = Instant::now();
         let effective_limit = if limit == 0 { 10 } else { limit.min(100) };
         let fts_expr = query.and_then(Self::build_fts_query);
+        let fts_build_us = build_start.elapsed().as_micros() as u64;
+
+        let open_start = Instant::now();
+        let reader = self.open_reader()?;
+        let db_open_us = open_start.elapsed().as_micros() as u64;
 
         let mut results = Vec::new();
-        if let Some(ref expr) = fts_expr {
+        let (fts_query_us, filter_post_us) = if let Some(ref expr) = fts_expr {
+            let prep_start = Instant::now();
             let stmt = reader.prepare(
                 "SELECT idx.id,
                         idx.title,
@@ -512,8 +557,12 @@ impl IndexStore for SqliteFtsIndexStore {
             )?;
             stmt.bind_text(1, expr)?;
             stmt.bind_i64(2, i64::from(effective_limit * 4))?;
-            collect_filtered_rows(&stmt, filters, effective_limit as usize, &mut results)?;
+            let prep_us = prep_start.elapsed().as_micros() as u64;
+            let (step_us, post_us) =
+                collect_filtered_rows(&stmt, filters, effective_limit as usize, &mut results)?;
+            (prep_us + step_us, post_us)
         } else {
+            let prep_start = Instant::now();
             let stmt = reader.prepare(
                 "SELECT idx.id,
                         idx.title,
@@ -528,10 +577,23 @@ impl IndexStore for SqliteFtsIndexStore {
                  LIMIT ?1;",
             )?;
             stmt.bind_i64(1, i64::from(effective_limit * 4))?;
-            collect_filtered_rows(&stmt, filters, effective_limit as usize, &mut results)?;
-        }
+            let prep_us = prep_start.elapsed().as_micros() as u64;
+            let (step_us, post_us) =
+                collect_filtered_rows(&stmt, filters, effective_limit as usize, &mut results)?;
+            (prep_us + step_us, post_us)
+        };
 
-        Ok(results)
+        let total_us = total_start.elapsed().as_micros() as u64;
+        Ok((
+            results,
+            SearchTimings {
+                fts_build_us,
+                db_open_us,
+                fts_query_us,
+                filter_post_us,
+                total_us,
+            },
+        ))
     }
 
     fn list_index_hashes(&self) -> Result<BTreeMap<String, String>, OmkError> {
@@ -560,8 +622,18 @@ fn collect_filtered_rows(
     filters: &SearchFilters,
     max_items: usize,
     out: &mut Vec<SearchResultSnippet>,
-) -> Result<(), OmkError> {
-    while stmt.step()? {
+) -> Result<(u64, u64), OmkError> {
+    let mut step_us_total = 0u64;
+    let mut post_us_total = 0u64;
+    loop {
+        let step_start = Instant::now();
+        let has_row = stmt.step()?;
+        step_us_total += step_start.elapsed().as_micros() as u64;
+        if !has_row {
+            break;
+        }
+
+        let post_start = Instant::now();
         let id = stmt.column_text(0);
         let title = stmt.column_text(1);
         let snippet = stmt.column_text(2);
@@ -572,16 +644,19 @@ fn collect_filtered_rows(
 
         if let Some(req_class) = filters.source_class {
             if source_class != req_class.as_str() {
+                post_us_total += post_start.elapsed().as_micros() as u64;
                 continue;
             }
         }
         if let Some(req_type) = filters.source_type {
             if source_type != req_type.as_str() {
+                post_us_total += post_start.elapsed().as_micros() as u64;
                 continue;
             }
         }
         if let Some(min_auth) = filters.min_authority {
             if authority < min_auth {
+                post_us_total += post_start.elapsed().as_micros() as u64;
                 continue;
             }
         }
@@ -603,6 +678,7 @@ fn collect_filtered_rows(
                 .iter()
                 .all(|req_tag| tags.iter().any(|t| t.eq_ignore_ascii_case(req_tag)));
             if !all_matched {
+                post_us_total += post_start.elapsed().as_micros() as u64;
                 continue;
             }
         }
@@ -617,12 +693,13 @@ fn collect_filtered_rows(
             authority,
             tags,
         });
+        post_us_total += post_start.elapsed().as_micros() as u64;
 
         if out.len() >= max_items {
             break;
         }
     }
-    Ok(())
+    Ok((step_us_total, post_us_total))
 }
 
 #[cfg(test)]
