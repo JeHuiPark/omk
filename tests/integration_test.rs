@@ -711,3 +711,160 @@ fn test_log_rotation_enforces_max_size_and_backup_retention() {
 
     let _ = fs::remove_dir_all(&vault_dir);
 }
+
+#[test]
+fn test_perf_static_invariants_persistent_connection_and_incremental_reconcile() {
+    use omk_core::domain::{
+        KnowledgeEntity, SourceClass, SourceProvenance, SourceType, SyncMetadata, SyncStrategy,
+        VaultSyncPolicy,
+    };
+    use omk_core::index::SqliteFtsIndexStore;
+    use omk_core::search::KnowledgePipeline;
+    use omk_core::vault::{DocumentStore, LocalMarkdownDocumentStore};
+    use std::sync::Arc;
+
+    let vault_dir = unique_test_dir("perf_invariants");
+    let daemon_cfg = DaemonConfig::new(&vault_dir).expect("daemon config");
+
+    // 1. Seed 50 documents on disk
+    let doc_store = Arc::new(
+        LocalMarkdownDocumentStore::new(&daemon_cfg.paths.vault_dir)
+            .expect("doc store")
+            .with_sync_policy(VaultSyncPolicy::AtomicRenameOnly),
+    );
+    let idx_store =
+        Arc::new(SqliteFtsIndexStore::new(&daemon_cfg.paths.db_path).expect("idx store"));
+
+    for i in 0..50 {
+        let title = format!("Perf Doc {}", i);
+        let content = format!("Body of performance test document {} with keywords alpha beta.", i);
+        let tags = vec!["perf".to_string()];
+        let vhash = KnowledgeEntity::compute_version_hash(&title, &content, &tags, None);
+        let entity = KnowledgeEntity {
+            id: format!("perf-doc-{:03}", i),
+            title,
+            source: SourceProvenance {
+                class: SourceClass::UserExplicit,
+                source_type: SourceType::Wiki,
+                provider: "local".to_string(),
+                uri: None,
+                external_id: None,
+            },
+            sync: SyncMetadata {
+                strategy: SyncStrategy::UpsertFull,
+                last_synced_at: "2026-11-21T00:00:00Z".to_string(),
+                version_hash: vhash,
+            },
+            authority: 1.0,
+            tags,
+            author: None,
+            state: None,
+            created_at: 1000 + (i as i64),
+            content,
+        };
+        doc_store.put_document(&entity).expect("put doc");
+    }
+
+    let pipeline = KnowledgePipeline::new(
+        Arc::clone(&doc_store) as Arc<dyn DocumentStore>,
+        Arc::clone(&idx_store) as Arc<dyn omk_core::index::IndexStore>,
+    );
+
+    // MET-STATIC-05: Initial reconcile of 50 docs commits in 1 single SQLite transaction
+    doc_store.reset_counters();
+    idx_store.reset_counters();
+    let rep1 = pipeline.reconcile().expect("initial reconcile");
+    assert_eq!(rep1.scanned_documents, 50);
+    assert_eq!(rep1.reindexed_count, 50);
+    assert_eq!(doc_store.parse_count(), 50);
+    assert_eq!(idx_store.tx_commit_count(), 1, "MET-STATIC-05: must commit in 1 transaction");
+
+    // MET-STATIC-04: Unchanged Vault incremental reconcile performs 0 Markdown body parses and 0 tx commits
+    doc_store.reset_counters();
+    idx_store.reset_counters();
+    let rep2 = pipeline.reconcile().expect("incremental reconcile");
+    assert_eq!(rep2.scanned_documents, 50);
+    assert_eq!(rep2.reindexed_count, 0);
+    assert_eq!(doc_store.parse_count(), 0, "MET-STATIC-04: must parse 0 unchanged files");
+    assert_eq!(idx_store.tx_commit_count(), 0);
+
+    drop(pipeline);
+    drop(idx_store);
+    drop(doc_store);
+
+    // MET-STATIC-03: DaemonServer::initialize performs 0 pre-bind file reads
+    let server = DaemonServer::initialize(daemon_cfg.clone()).expect("init daemon");
+    assert_eq!(
+        server.doc_store().parse_count(),
+        0,
+        "MET-STATIC-03: pre-bind file reads must be 0"
+    );
+    let accepted_handle = server.accepted_connections_handle();
+    let server_thread = thread::spawn(move || {
+        server.run_blocking().expect("run_blocking");
+    });
+
+    let mut proxy_cfg = ProxyConfig::new(&vault_dir).expect("proxy config");
+    proxy_cfg.auto_spawn_daemon = false;
+    let proxy = McpProxy::new(proxy_cfg);
+
+    // MET-STATIC-01: Send M=50 consecutive requests over a single McpProxy session
+    for i in 0..50 {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"search_knowledge","params":{{"query":"alpha beta","limit":5}}}}"#,
+            i + 1
+        );
+        let resp = proxy.forward_line(&req).expect("search response");
+        assert!(resp.contains("\"matches\""));
+    }
+
+    assert_eq!(
+        proxy.connect_count(),
+        1,
+        "MET-STATIC-01: proxy must establish only 1 UDS connection across 50 requests"
+    );
+    assert_eq!(
+        accepted_handle.load(Ordering::SeqCst),
+        1,
+        "MET-STATIC-01: daemon must accept only 1 UDS connection across 50 requests"
+    );
+
+    // Stop daemon via Self-wake (`daemon/shutdown`)
+    let _ = proxy.forward_line(r#"{"jsonrpc":"2.0","id":999,"method":"daemon/shutdown"}"#);
+    server_thread.join().expect("join daemon thread");
+
+    let _ = fs::remove_dir_all(&vault_dir);
+}
+
+#[test]
+fn test_cli_omk_bench_verifies_all_8_static_invariants() {
+    let bin = env!("CARGO_BIN_EXE_omk");
+    let bench_out = Command::new(bin)
+        .args(["bench", "--docs", "300", "--turns", "10", "--json"])
+        .output()
+        .expect("run omk bench --json");
+    assert!(
+        bench_out.status.success(),
+        "omk bench failed: stderr={}",
+        String::from_utf8_lossy(&bench_out.stderr)
+    );
+    let stdout_str = String::from_utf8_lossy(&bench_out.stdout);
+    let parsed = JsonValue::parse(stdout_str.trim()).expect("parse bench json");
+    assert_eq!(parsed.get("status").and_then(JsonValue::as_str), Some("ok"));
+    assert_eq!(
+        parsed
+            .get("all_invariants_passed")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    let invariants = parsed
+        .get("static_invariants")
+        .and_then(JsonValue::as_array)
+        .expect("static_invariants array");
+    assert_eq!(invariants.len(), 8);
+    for inv in invariants {
+        let id = inv.get("id").and_then(JsonValue::as_str).unwrap_or("?");
+        let passed = inv.get("passed").and_then(JsonValue::as_bool).unwrap_or(false);
+        assert!(passed, "Static invariant {} failed in omk bench", id);
+    }
+}
