@@ -562,10 +562,45 @@ pub struct SearchMetrics {
     pub result_count: usize,
     /// `true` if `result_count == 0`.
     pub zero_hit: bool,
+    /// `true` if 1st-pass strict `AND` returned 0 hits and 2nd-pass `OR` BM25 fallback was executed (`REQ-PERF-004`, `MET-STATIC-08`).
+    pub fallback_used: bool,
     /// Total UTF-8 byte length across all returned snippets.
     pub content_bytes: usize,
     /// Estimated LLM token count across all returned snippets.
     pub estimated_tokens: usize,
+}
+
+/// Lightweight file system metadata for an unparsed Markdown document in the Vault (`REQ-PERF-002`, `MET-STATIC-04`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultFileMetadata {
+    /// Safe document identifier (filename stem without `.md`).
+    pub id: String,
+    /// File modification time in nanoseconds since `UNIX_EPOCH` (`0` if unavailable).
+    pub file_mtime_ns: i64,
+    /// File size in bytes on disk.
+    pub file_size: i64,
+}
+
+/// Indexed document version and file metadata stored in `knowledge_index` for O(1) incremental reconciliation (`REQ-PERF-002`, `MET-STATIC-04`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedDocEntry {
+    /// Document identifier.
+    pub id: String,
+    /// Deterministic content version hash (`FNV-1a` 64-bit hex).
+    pub version_hash: String,
+    /// Last recorded file modification time in nanoseconds since `UNIX_EPOCH`.
+    pub file_mtime_ns: i64,
+    /// Last recorded file size in bytes.
+    pub file_size: i64,
+}
+
+/// Disk durability policy for [`crate::vault::LocalMarkdownDocumentStore`] writes (`REQ-PERF-005`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultSyncPolicy {
+    /// Calls `fsync` (`File::sync_all`) on every temporary file before atomic rename (default production safety).
+    FsyncEachWrite,
+    /// Skips `File::sync_all` while preserving atomic `.tmp` + `rename` replacement (used for synthetic pipeline benchmarking or high-throughput batch seeding).
+    AtomicRenameOnly,
 }
 
 /// Microsecond-level Span timings for `read_knowledge` (`REQ-OBS-001`).

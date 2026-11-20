@@ -237,10 +237,11 @@ impl KnowledgePipeline {
         let validate_read_us = val_start.elapsed().as_micros() as u64;
 
         // 3. Vault Writer (SSOT) -> 4. Indexer (IndexStore)
-        let (file_path, vault_write_us, vault_fsync_us) =
-            self.doc_store.put_document_timed(&entity)?;
+        let (file_path, vault_write_us, vault_fsync_us, file_mtime_ns, file_size) =
+            self.doc_store.put_document_with_meta(&entity)?;
         let idx_start = Instant::now();
-        self.index_store.upsert_index(&entity)?;
+        self.index_store
+            .upsert_index_with_meta(&entity, file_mtime_ns, file_size)?;
         let index_write_us = idx_start.elapsed().as_micros() as u64;
         let total_us = total_start.elapsed().as_micros() as u64;
 
@@ -288,7 +289,7 @@ impl KnowledgePipeline {
     }
 
     /// Executes the Query Pipeline (`search_knowledge`) and returns matched snippets alongside
-    /// [`SearchTimings`] and [`SearchMetrics`] (`REQ-OBS-001`, `REQ-OBS-002`).
+    /// [`SearchTimings`] and [`SearchMetrics`] (`REQ-OBS-001`, `REQ-OBS-002`, `REQ-PERF-004`).
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if querying the index fails.
@@ -310,9 +311,11 @@ impl KnowledgePipeline {
             }
         }
 
-        let (matches, timings) = self
-            .index_store
-            .search_timed(query.query.as_deref(), &query.filters, query.limit)?;
+        let (matches, timings, fallback_used) = self.index_store.search_timed_with_fallback(
+            query.query.as_deref(),
+            &query.filters,
+            query.limit,
+        )?;
 
         let content_bytes: usize = matches.iter().map(|m| m.snippet.len() + m.title.len()).sum();
         let result_count = matches.len();
@@ -328,6 +331,7 @@ impl KnowledgePipeline {
             requested_limit: query.limit,
             result_count,
             zero_hit: result_count == 0,
+            fallback_used,
             content_bytes,
             estimated_tokens: estimate_tokens(content_bytes),
         };
@@ -377,8 +381,9 @@ impl KnowledgePipeline {
         Ok((entity, timings, metrics))
     }
 
-    /// Reconciles the [`DocumentStore`] (SSOT) and [`IndexStore`] by comparing `version_hash` values,
-    /// rebuilding missing or outdated index entries and pruning orphaned entries (`docs/architecture.md` §5.3).
+    /// Reconciles the [`DocumentStore`] (SSOT) and [`IndexStore`] by comparing file metadata
+    /// (`file_mtime_ns`, `file_size`) and `version_hash` values, rebuilding missing or outdated
+    /// index entries and pruning orphaned entries in a single batched transaction (`REQ-PERF-002`).
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if reading the Vault or updating the index fails.
@@ -388,52 +393,97 @@ impl KnowledgePipeline {
     }
 
     /// Reconciles the [`DocumentStore`] and [`IndexStore`] and returns both the [`ReconcileReport`]
-    /// and microsecond-level [`ReconcileTimings`] (`REQ-OBS-001`).
+    /// and microsecond-level [`ReconcileTimings`] (`REQ-OBS-001`, `REQ-PERF-002`, `MET-STATIC-04`, `MET-STATIC-05`).
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if reading the Vault or updating the index fails.
     pub fn reconcile_timed(&self) -> Result<(ReconcileReport, ReconcileTimings), OmkError> {
         let total_start = Instant::now();
 
-        let scan_start = Instant::now();
-        let vault_docs = self.doc_store.list_documents()?;
-        let vault_scan_us = scan_start.elapsed().as_micros() as u64;
-
         let hash_start = Instant::now();
-        let index_hashes = self.index_store.list_index_hashes()?;
+        let index_entries = self.index_store.list_index_entries()?;
         let index_hash_scan_us = hash_start.elapsed().as_micros() as u64;
 
-        let reindex_start = Instant::now();
+        let scan_start = Instant::now();
         let mut seen_ids = BTreeSet::new();
-        let mut reindexed_count = 0usize;
+        let mut upserts_to_batch: Vec<(KnowledgeEntity, i64, i64)> = Vec::new();
+        let mut meta_backfills: Vec<(KnowledgeEntity, i64, i64)> = Vec::new();
+        let scanned_documents: usize;
 
-        for doc in &vault_docs {
-            seen_ids.insert(doc.id.clone());
-            let needs_reindex = match index_hashes.get(&doc.id) {
-                Some(indexed_hash) => indexed_hash != &doc.sync.version_hash,
-                None => true,
-            };
-            if needs_reindex {
-                self.index_store.upsert_index(doc)?;
-                reindexed_count += 1;
+        if let Some(meta_list) = self.doc_store.list_document_metadata()? {
+            scanned_documents = meta_list.len();
+            for meta in meta_list {
+                seen_ids.insert(meta.id.clone());
+                let is_unchanged = match index_entries.get(&meta.id) {
+                    Some(idx_entry) => {
+                        meta.file_mtime_ns > 0
+                            && meta.file_size > 0
+                            && idx_entry.file_mtime_ns == meta.file_mtime_ns
+                            && idx_entry.file_size == meta.file_size
+                            && !idx_entry.version_hash.is_empty()
+                    }
+                    None => false,
+                };
+                if is_unchanged {
+                    // MET-STATIC-04: Skip reading and parsing unchanged Markdown files
+                    continue;
+                }
+
+                if let Ok(doc) = self.doc_store.get_document(&meta.id) {
+                    seen_ids.insert(doc.id.clone());
+                    let needs_reindex = match index_entries.get(&doc.id) {
+                        Some(idx_entry) => idx_entry.version_hash != doc.sync.version_hash,
+                        None => true,
+                    };
+                    if needs_reindex {
+                        upserts_to_batch.push((doc, meta.file_mtime_ns, meta.file_size));
+                    } else {
+                        meta_backfills.push((doc, meta.file_mtime_ns, meta.file_size));
+                    }
+                }
+            }
+        } else {
+            let vault_docs = self.doc_store.list_documents()?;
+            scanned_documents = vault_docs.len();
+            for doc in vault_docs {
+                seen_ids.insert(doc.id.clone());
+                let needs_reindex = match index_entries.get(&doc.id) {
+                    Some(idx_entry) => idx_entry.version_hash != doc.sync.version_hash,
+                    None => true,
+                };
+                if needs_reindex {
+                    upserts_to_batch.push((doc, 0, 0));
+                }
             }
         }
-        let reindex_write_us = reindex_start.elapsed().as_micros() as u64;
+        let vault_scan_us = scan_start.elapsed().as_micros() as u64;
 
         let prune_start = Instant::now();
-        let mut removed_orphans_count = 0usize;
-        for indexed_id in index_hashes.keys() {
+        let mut orphans_to_delete = Vec::new();
+        for indexed_id in index_entries.keys() {
             if !seen_ids.contains(indexed_id) {
-                self.index_store.delete_index(indexed_id)?;
-                removed_orphans_count += 1;
+                orphans_to_delete.push(indexed_id.clone());
             }
         }
         let orphan_prune_us = prune_start.elapsed().as_micros() as u64;
+
+        let reindex_start = Instant::now();
+        let reindexed_count = upserts_to_batch.len();
+        let removed_orphans_count = orphans_to_delete.len();
+        for (doc, mtime_ns, size) in &meta_backfills {
+            let _ = self
+                .index_store
+                .upsert_index_with_meta(doc, *mtime_ns, *size);
+        }
+        // MET-STATIC-05: Execute all K upserts and orphan deletions in a single SQLite transaction
+        self.index_store
+            .batch_reconcile(&upserts_to_batch, &orphans_to_delete)?;
+        let reindex_write_us = reindex_start.elapsed().as_micros() as u64;
         let total_us = total_start.elapsed().as_micros() as u64;
 
         Ok((
             ReconcileReport {
-                scanned_documents: vault_docs.len(),
+                scanned_documents,
                 reindexed_count,
                 removed_orphans_count,
             },

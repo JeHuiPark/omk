@@ -7,6 +7,8 @@
 //!   Read-only diagnostics for the Local Vault, SQLite index, background daemon, harnesses, and observability.
 //! - `omk stats [--vault <dir>] [--last <N>] [--slow-ms <ms>] [--reset] [--json]`:
 //!   Privacy-preserving performance and agent efficiency analytics (`REQ-OBS-005`).
+//! - `omk bench [--docs <N>] [--turns <T>] [--json]`:
+//!   Deterministic static invariant (`MET-STATIC-01` .. `08`) and synthetic persona workload benchmark (`REQ-PERF-006`).
 //! - `omk reconcile [--vault <dir>] [--json]`:
 //!   Runs Vault-Index reconciliation (`fsck`) and prints a summary report.
 //! - `omk stop [--vault <dir>] [--json]`:
@@ -23,8 +25,8 @@ use omk::agent_prompt::{
     HarnessSelection,
 };
 use omk::daemon::{
-    compute_telemetry_stats, reset_telemetry_logs, DaemonConfig, DaemonPaths, DaemonServer,
-    TelemetryStatsReport,
+    compute_telemetry_stats, reset_telemetry_logs, run_synthetic_benchmark, BenchmarkReport,
+    DaemonConfig, DaemonPaths, DaemonServer, TelemetryStatsReport,
 };
 use omk::protocol::format_rpc_error;
 use omk::proxy::{McpProxy, ProxyConfig};
@@ -70,7 +72,7 @@ fn default_vault_dir() -> PathBuf {
     default_home_dir().join(".omk").join("vault")
 }
 
-/// Parsed CLI command and options (`REQ-CLI-001`, `REQ-CLI-002`, `REQ-CLI-005`, `REQ-OBS-005`).
+/// Parsed CLI command and options (`REQ-CLI-001`, `REQ-CLI-002`, `REQ-CLI-005`, `REQ-OBS-005`, `REQ-PERF-006`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subcommand {
     /// `omk install`
@@ -79,6 +81,8 @@ pub enum Subcommand {
     Status,
     /// `omk stats`
     Stats,
+    /// `omk bench`
+    Bench,
     /// `omk reconcile`
     Reconcile,
     /// `omk stop`
@@ -113,11 +117,15 @@ pub struct CliOptions {
     pub slow_threshold_ms: f64,
     /// Whether to reset telemetry logs in `omk stats` (`--reset`).
     pub reset_stats: bool,
+    /// Number of synthetic documents to seed in `omk bench` (`--docs <N>`, default 3000).
+    pub bench_docs: usize,
+    /// Number of simulated user turns in `omk bench` (`--turns <T>`, default 80).
+    pub bench_turns: usize,
     /// Whether machine-readable single-line JSON output was requested (`--json`).
     pub json_output: bool,
 }
 
-/// Strictly parses command-line arguments (`REQ-CLI-001`, `REQ-OBS-005`).
+/// Strictly parses command-line arguments (`REQ-CLI-001`, `REQ-OBS-005`, `REQ-PERF-006`).
 ///
 /// Rejects unknown subcommands, unknown flags, and flags missing required values.
 fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, String> {
@@ -128,6 +136,8 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
     let mut last_n: Option<usize> = None;
     let mut slow_threshold_ms: f64 = 50.0;
     let mut reset_stats = false;
+    let mut bench_docs: usize = 3000;
+    let mut bench_turns: usize = 80;
     let mut json_output = false;
     let mut help_requested = false;
     let mut version_requested = false;
@@ -151,6 +161,34 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
             "--reset" => {
                 reset_stats = true;
                 i += 1;
+            }
+            "--docs" => {
+                let val = args.get(i + 1).ok_or_else(|| {
+                    "Option '--docs' requires a positive integer document count.\n[HINT] Example: omk bench --docs 3000"
+                        .to_string()
+                })?;
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--docs' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                bench_docs = parsed;
+                i += 2;
+            }
+            "--turns" => {
+                let val = args.get(i + 1).ok_or_else(|| {
+                    "Option '--turns' requires a positive integer turn count.\n[HINT] Example: omk bench --turns 80"
+                        .to_string()
+                })?;
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--turns' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                bench_turns = parsed;
+                i += 2;
             }
             "--last" => {
                 let val = args.get(i + 1).ok_or_else(|| {
@@ -256,6 +294,28 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                 harness_spec = Some(val.to_string());
                 i += 1;
             }
+            _ if arg.starts_with("--docs=") => {
+                let val = &arg["--docs=".len()..];
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--docs=' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                bench_docs = parsed;
+                i += 1;
+            }
+            _ if arg.starts_with("--turns=") => {
+                let val = &arg["--turns=".len()..];
+                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    format!(
+                        "Option '--turns=' requires a positive integer, but found '{}'.",
+                        val
+                    )
+                })?;
+                bench_turns = parsed;
+                i += 1;
+            }
             _ if arg.starts_with("--last=") => {
                 let val = &arg["--last=".len()..];
                 let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
@@ -288,7 +348,8 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     arg
                 ));
             }
-            "install" | "status" | "stats" | "reconcile" | "stop" | "mcp" | "daemon" | "help" => {
+            "install" | "status" | "stats" | "bench" | "reconcile" | "stop" | "mcp"
+            | "daemon" | "help" => {
                 if subcommand.is_some() {
                     return Err(format!(
                         "Unexpected extra subcommand '{}'. Only one subcommand may be specified.",
@@ -299,6 +360,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     "install" => Subcommand::Install,
                     "status" => Subcommand::Status,
                     "stats" => Subcommand::Stats,
+                    "bench" => Subcommand::Bench,
                     "reconcile" => Subcommand::Reconcile,
                     "stop" => Subcommand::Stop,
                     "mcp" => Subcommand::Mcp { explicit: true },
@@ -314,7 +376,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     continue;
                 }
                 return Err(format!(
-                    "Unknown command '{}'.\n[HINT] Did you mean one of: install, status, stats, reconcile, stop, mcp, daemon, help? Run 'omk --help' for usage.",
+                    "Unknown command '{}'.\n[HINT] Did you mean one of: install, status, stats, bench, reconcile, stop, mcp, daemon, help? Run 'omk --help' for usage.",
                     other
                 ));
             }
@@ -343,6 +405,8 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
         last_n,
         slow_threshold_ms,
         reset_stats,
+        bench_docs,
+        bench_turns,
         json_output,
     })
 }
@@ -359,6 +423,7 @@ COMMANDS:
   install     Auto-detect AI agent harnesses and provision SKILL.md + MCP config
   status      Inspect Local Vault, SQLite index, background daemon, and harnesses
   stats       Analyze execution latency percentiles, stage bottlenecks, and search quality
+  bench       Verify deterministic static invariants (MET-STATIC-01..08) & synthetic workload SLAs
   reconcile   Verify and repair Vault Markdown <-> SQLite FTS5 index consistency
   stop        Gracefully stop the running background daemon for the Vault
   mcp         Run the Stdio MCP / JSON-RPC 2.0 proxy (used by AI agent harnesses)
@@ -375,6 +440,8 @@ OPTIONS:
       --last <N>         Analyze only the most recent N RPC requests in 'omk stats'
       --slow-ms <MS>     Threshold in ms for slow request anomalies in 'omk stats' [default: 50]
       --reset            Clear local telemetry log files in 'omk stats'
+      --docs <N>         Number of synthetic documents to seed in 'omk bench' [default: 3000]
+      --turns <T>        Number of simulated user turns in 'omk bench' [default: 80]
       --json             Output machine-readable single-line JSON
   -V, --version          Display version information
   -h, --help             Display help information
@@ -385,6 +452,7 @@ EXAMPLES:
   omk install --harness all                     # Provision all 7 supported harnesses
   omk status                                    # Check Vault, daemon, and harness status
   omk stats                                     # View P50/P95 latency & stage bottleneck report
+  omk bench --docs 3000 --turns 80              # Run 1-year Vault (3000 docs) & 8h day (80 turns) benchmark
   omk reconcile                                 # Rebuild/sync SQLite index from Vault Markdown
 "#,
         ver = VERSION,
@@ -995,6 +1063,174 @@ fn format_stats_human(
     out
 }
 
+fn run_bench_command(docs_count: usize, turns_count: usize, json_output: bool) -> Result<(), OmkError> {
+    let report = run_synthetic_benchmark(docs_count, turns_count)?;
+    if json_output {
+        println!("{}", format_bench_json(&report));
+    } else {
+        print!("{}", format_bench_human(&report));
+    }
+    if !report.all_invariants_passed {
+        return Err(OmkError::InternalError(
+            "One or more static invariants (MET-STATIC-01..08) failed during benchmark".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn format_bench_json(report: &BenchmarkReport) -> String {
+    let inv_arr: Vec<JsonValue> = report
+        .static_invariants
+        .iter()
+        .map(|c| {
+            let mut m = BTreeMap::new();
+            m.insert("id".to_string(), JsonValue::Str(c.id.clone()));
+            m.insert("name".to_string(), JsonValue::Str(c.name.clone()));
+            m.insert("observed".to_string(), JsonValue::Str(c.observed.clone()));
+            m.insert("target".to_string(), JsonValue::Str(c.target.clone()));
+            m.insert("passed".to_string(), JsonValue::Bool(c.passed));
+            JsonValue::Object(m)
+        })
+        .collect();
+
+    let encode_dist = |d: &omk::daemon::LatencyDistribution| -> JsonValue {
+        let mut m = BTreeMap::new();
+        m.insert("count".to_string(), JsonValue::Number(d.count as f64));
+        m.insert("avg_ms".to_string(), JsonValue::Number(round_f64(d.avg_ms)));
+        m.insert("p50_ms".to_string(), JsonValue::Number(round_f64(d.p50_ms)));
+        m.insert("p95_ms".to_string(), JsonValue::Number(round_f64(d.p95_ms)));
+        m.insert("p99_ms".to_string(), JsonValue::Number(round_f64(d.p99_ms)));
+        m.insert("max_ms".to_string(), JsonValue::Number(round_f64(d.max_ms)));
+        JsonValue::Object(m)
+    };
+
+    let mut sla_obj = BTreeMap::new();
+    sla_obj.insert(
+        "search_knowledge".to_string(),
+        encode_dist(&report.search_latency),
+    );
+    sla_obj.insert(
+        "read_knowledge".to_string(),
+        encode_dist(&report.read_latency),
+    );
+    sla_obj.insert(
+        "upsert_knowledge".to_string(),
+        encode_dist(&report.upsert_latency),
+    );
+    sla_obj.insert(
+        "cold_start_ready_ms".to_string(),
+        JsonValue::Number(round_f64(report.cold_start_ready_ms)),
+    );
+    sla_obj.insert(
+        "incremental_reconcile_ms".to_string(),
+        JsonValue::Number(round_f64(report.incremental_reconcile_ms)),
+    );
+    sla_obj.insert(
+        "full_reconcile_ms".to_string(),
+        JsonValue::Number(round_f64(report.full_reconcile_ms)),
+    );
+    sla_obj.insert(
+        "total_workload_ms".to_string(),
+        JsonValue::Number(round_f64(report.total_workload_ms)),
+    );
+
+    let mut root = BTreeMap::new();
+    root.insert(
+        "status".to_string(),
+        JsonValue::Str(
+            if report.all_invariants_passed {
+                "ok"
+            } else {
+                "failed"
+            }
+            .to_string(),
+        ),
+    );
+    root.insert(
+        "seeded_docs".to_string(),
+        JsonValue::Number(report.seeded_docs as f64),
+    );
+    root.insert(
+        "simulated_turns".to_string(),
+        JsonValue::Number(report.simulated_turns as f64),
+    );
+    root.insert(
+        "total_rpc_calls".to_string(),
+        JsonValue::Number(report.total_rpc_calls as f64),
+    );
+    root.insert(
+        "all_invariants_passed".to_string(),
+        JsonValue::Bool(report.all_invariants_passed),
+    );
+    root.insert("static_invariants".to_string(), JsonValue::Array(inv_arr));
+    root.insert("workload_slas".to_string(), JsonValue::Object(sla_obj));
+    JsonValue::Object(root).to_json_string()
+}
+
+fn format_bench_human(report: &BenchmarkReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "omk v{} - Deterministic Static Invariant & Synthetic Persona Workload Benchmark\n",
+        VERSION
+    ));
+    out.push_str("===============================================================================\n");
+    out.push_str(&format!(
+        "  Workload Profile  : {} Vault Docs | {} User Turns ({} total RPC calls)\n",
+        report.seeded_docs, report.simulated_turns, report.total_rpc_calls
+    ));
+    out.push_str(&format!(
+        "  Invariant Status  : {}\n\n",
+        if report.all_invariants_passed {
+            "ALL 8 STATIC INVARIANTS PASSED (100% Deterministic)"
+        } else {
+            "FAILED (See invariant details below)"
+        }
+    ));
+
+    out.push_str("[1. Static / Deterministic Complexity Invariants (MET-STATIC-01 .. 08)]\n");
+    for c in &report.static_invariants {
+        let badge = if c.passed { "PASS" } else { "FAIL" };
+        out.push_str(&format!(
+            "  [{}] {:<14} {:<52}\n         Observed: {:<36} | Target: {}\n",
+            badge, c.id, c.name, c.observed, c.target
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("[2. Synthetic Persona Workload Latency SLAs (ms)]\n");
+    out.push_str("  Operation                 Count     Avg ms     P50 ms     P95 ms     P99 ms     Max ms\n");
+    out.push_str("  --------------------------------------------------------------------------------------\n");
+    for (label, d) in [
+        ("search_knowledge (E2E)", &report.search_latency),
+        ("read_knowledge (E2E)", &report.read_latency),
+        ("upsert_knowledge (E2E)", &report.upsert_latency),
+    ] {
+        out.push_str(&format!(
+            "  {:<25} {:>5} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}\n",
+            label, d.count, d.avg_ms, d.p50_ms, d.p95_ms, d.p99_ms, d.max_ms
+        ));
+    }
+    out.push('\n');
+    out.push_str("  Lifecycle & Reconciliation Metrics:\n");
+    out.push_str(&format!(
+        "    * Daemon Cold Start Ready Time       : {:>8.2} ms (SLA P95 <= 50.0 ms)\n",
+        report.cold_start_ready_ms
+    ));
+    out.push_str(&format!(
+        "    * Incremental Reconcile (No-op)      : {:>8.2} ms (SLA P95 <= 30.0 ms)\n",
+        report.incremental_reconcile_ms
+    ));
+    out.push_str(&format!(
+        "    * Full Index Rebuild (1 Batched Tx)  : {:>8.2} ms (SLA P95 <= 800.0 ms)\n",
+        report.full_reconcile_ms
+    ));
+    out.push_str(&format!(
+        "    * Total Daily Workload ({} Turns)    : {:>8.2} ms (SLA <= 1,000.0 ms / day)\n",
+        report.simulated_turns, report.total_workload_ms
+    ));
+    out
+}
+
 fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
     match opts.subcommand {
         Subcommand::Version => {
@@ -1008,7 +1244,7 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
         Subcommand::Help => {
             if opts.json_output {
                 println!(
-                    r#"{{"name":"omk","version":"{}","commands":["install","status","stats","reconcile","stop","mcp","daemon","help"]}}"#,
+                    r#"{{"name":"omk","version":"{}","commands":["install","status","stats","bench","reconcile","stop","mcp","daemon","help"]}}"#,
                     VERSION
                 );
             } else {
@@ -1077,6 +1313,7 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
             opts.reset_stats,
             opts.json_output,
         ),
+        Subcommand::Bench => run_bench_command(opts.bench_docs, opts.bench_turns, opts.json_output),
         Subcommand::Reconcile => {
             let paths = DaemonPaths::resolve(&opts.vault_dir)?;
             let doc_store = Arc::new(LocalMarkdownDocumentStore::new(&paths.vault_dir)?);
@@ -1223,6 +1460,22 @@ mod tests {
         assert_eq!(opts.last_n, Some(25));
         assert_eq!(opts.slow_threshold_ms, 12.5);
         assert!(opts.reset_stats);
+        assert!(opts.json_output);
+    }
+
+    #[test]
+    fn test_cli_parser_accepts_bench_and_options() {
+        let args = vec![
+            "bench".to_string(),
+            "--docs".to_string(),
+            "3000".to_string(),
+            "--turns=80".to_string(),
+            "--json".to_string(),
+        ];
+        let opts = parse_cli_args_from(&args, true).expect("valid bench args");
+        assert_eq!(opts.subcommand, Subcommand::Bench);
+        assert_eq!(opts.bench_docs, 3000);
+        assert_eq!(opts.bench_turns, 80);
         assert!(opts.json_output);
     }
 }

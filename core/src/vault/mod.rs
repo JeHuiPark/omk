@@ -6,12 +6,20 @@
 
 use crate::domain::{
     KnowledgeEntity, OmkError, SourceClass, SourceProvenance, SourceType, SyncMetadata,
-    SyncStrategy,
+    SyncStrategy, VaultFileMetadata, VaultSyncPolicy,
 };
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::raw::c_int;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Instant, UNIX_EPOCH};
+
+extern "C" {
+    fn fsync(fd: c_int) -> c_int;
+}
 
 /// Storage abstraction for the Single Source of Truth (SSOT) Markdown Vault (`docs/architecture.md` §5.1).
 pub trait DocumentStore: Send + Sync {
@@ -31,6 +39,19 @@ pub trait DocumentStore: Send + Sync {
         let start = Instant::now();
         let rel = self.put_document(entity)?;
         Ok((rel, start.elapsed().as_micros() as u64, 0))
+    }
+
+    /// Persists a [`KnowledgeEntity`] and returns `(relative_path, vault_write_us, vault_fsync_us, file_mtime_ns, file_size)`
+    /// (`REQ-PERF-002`, `MET-STATIC-04`).
+    ///
+    /// # Errors
+    /// Returns the same errors as [`DocumentStore::put_document`].
+    fn put_document_with_meta(
+        &self,
+        entity: &KnowledgeEntity,
+    ) -> Result<(String, u64, u64, i64, i64), OmkError> {
+        let (rel, write_us, fsync_us) = self.put_document_timed(entity)?;
+        Ok((rel, write_us, fsync_us, 0, 0))
     }
 
     /// Loads a [`KnowledgeEntity`] by its document ID.
@@ -58,21 +79,35 @@ pub trait DocumentStore: Send + Sync {
     /// if the ID is invalid.
     fn delete_document(&self, id: &str) -> Result<(), OmkError>;
 
-    /// Lists all [`KnowledgeEntity`] documents currently stored in the Vault (used for reconciliation/`fsck`).
+    /// Lists all [`KnowledgeEntity`] documents currently stored in the Vault (used for full reconciliation/`fsck`).
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if reading the Vault directory fails.
     fn list_documents(&self) -> Result<Vec<KnowledgeEntity>, OmkError>;
+
+    /// Lists lightweight file metadata (`id`, `file_mtime_ns`, `file_size`) for all `.md` files in the Vault
+    /// without reading or parsing their Markdown bodies (`REQ-PERF-002`, `MET-STATIC-04`).
+    ///
+    /// Returns `Ok(None)` for in-memory mock implementations that do not track OS file timestamps.
+    ///
+    /// # Errors
+    /// Returns [`OmkError::InternalError`] if scanning the directory fails.
+    fn list_document_metadata(&self) -> Result<Option<Vec<VaultFileMetadata>>, OmkError> {
+        Ok(None)
+    }
 }
 
 /// Local file system implementation of [`DocumentStore`] storing `.md` files in a dedicated root directory.
 #[derive(Debug, Clone)]
 pub struct LocalMarkdownDocumentStore {
     root_dir: PathBuf,
+    sync_policy: VaultSyncPolicy,
+    parse_counter: Arc<AtomicUsize>,
+    write_counter: Arc<AtomicUsize>,
 }
 
 impl LocalMarkdownDocumentStore {
-    /// Creates or opens a local Markdown Vault at `root_dir`.
+    /// Creates or opens a local Markdown Vault at `root_dir` with default `FsyncEachWrite` durability.
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if the directory cannot be created or canonicalized.
@@ -94,7 +129,37 @@ impl LocalMarkdownDocumentStore {
         })?;
         Ok(Self {
             root_dir: canonical,
+            sync_policy: VaultSyncPolicy::FsyncEachWrite,
+            parse_counter: Arc::new(AtomicUsize::new(0)),
+            write_counter: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Configures the disk synchronization policy (`FsyncEachWrite` vs `AtomicRenameOnly`, `REQ-PERF-005`).
+    pub fn with_sync_policy(mut self, policy: VaultSyncPolicy) -> Self {
+        self.sync_policy = policy;
+        self
+    }
+
+    /// Updates the disk synchronization policy in place (`REQ-PERF-005`).
+    pub fn set_sync_policy(&mut self, policy: VaultSyncPolicy) {
+        self.sync_policy = policy;
+    }
+
+    /// Returns the cumulative number of Markdown files read and parsed from disk (`REQ-PERF-006`, `MET-STATIC-04`).
+    pub fn parse_count(&self) -> usize {
+        self.parse_counter.load(Ordering::SeqCst)
+    }
+
+    /// Returns the cumulative number of Markdown documents written to disk (`REQ-PERF-006`).
+    pub fn write_count(&self) -> usize {
+        self.write_counter.load(Ordering::SeqCst)
+    }
+
+    /// Resets the static instrumentation counters (`parse_count` and `write_count`) to zero (`REQ-PERF-006`).
+    pub fn reset_counters(&self) {
+        self.parse_counter.store(0, Ordering::SeqCst);
+        self.write_counter.store(0, Ordering::SeqCst);
     }
 
     /// Returns the canonical root directory path of the Vault.
@@ -365,16 +430,24 @@ impl LocalMarkdownDocumentStore {
 
 impl DocumentStore for LocalMarkdownDocumentStore {
     fn put_document(&self, entity: &KnowledgeEntity) -> Result<String, OmkError> {
-        let (rel, _, _) = self.put_document_timed(entity)?;
+        let (rel, _, _, _, _) = self.put_document_with_meta(entity)?;
         Ok(rel)
     }
 
     fn put_document_timed(&self, entity: &KnowledgeEntity) -> Result<(String, u64, u64), OmkError> {
+        let (rel, write_us, fsync_us, _, _) = self.put_document_with_meta(entity)?;
+        Ok((rel, write_us, fsync_us))
+    }
+
+    fn put_document_with_meta(
+        &self,
+        entity: &KnowledgeEntity,
+    ) -> Result<(String, u64, u64, i64, i64), OmkError> {
         let write_start = Instant::now();
         let target_path = self.resolve_safe_path(&entity.id)?;
         let markdown = Self::render_markdown(entity);
 
-        // Atomic write via temporary file in the same directory + fsync + rename
+        // Atomic write via temporary file in the same directory + optional fsync + rename
         let tmp_name = format!(
             ".{}.md.tmp.{}",
             entity.id,
@@ -398,15 +471,19 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                     e
                 ))
             })?;
-            let fsync_start = Instant::now();
-            file.sync_all().map_err(|e| {
-                OmkError::InternalError(format!(
-                    "Failed to fsync temporary Vault file '{}': {}",
-                    tmp_path.display(),
-                    e
-                ))
-            })?;
-            fsync_us = fsync_start.elapsed().as_micros() as u64;
+            if self.sync_policy == VaultSyncPolicy::FsyncEachWrite {
+                let fsync_start = Instant::now();
+                let rc = unsafe { fsync(file.as_raw_fd()) };
+                if rc != 0 {
+                    return Err(OmkError::InternalError(format!(
+                        "Failed to fsync temporary Vault file '{}'",
+                        tmp_path.display()
+                    )));
+                }
+                fsync_us = (fsync_start.elapsed().as_micros() as u64).max(1);
+            } else {
+                fsync_us = 0;
+            }
         }
 
         fs::rename(&tmp_path, &target_path).map_err(|e| {
@@ -417,10 +494,23 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                 e
             ))
         })?;
+        self.write_counter.fetch_add(1, Ordering::SeqCst);
+
+        let (file_mtime_ns, file_size) = fs::metadata(&target_path)
+            .ok()
+            .map(|m| extract_mtime_and_size(&m))
+            .unwrap_or((0, markdown.len() as i64));
+
         let total_vault_us = write_start.elapsed().as_micros() as u64;
         let vault_write_us = total_vault_us.saturating_sub(fsync_us);
 
-        Ok((format!("{}.md", entity.id), vault_write_us, fsync_us))
+        Ok((
+            format!("{}.md", entity.id),
+            vault_write_us,
+            fsync_us,
+            file_mtime_ns,
+            file_size,
+        ))
     }
 
     fn get_document(&self, id: &str) -> Result<KnowledgeEntity, OmkError> {
@@ -447,6 +537,7 @@ impl DocumentStore for LocalMarkdownDocumentStore {
         let vault_read_us = read_start.elapsed().as_micros() as u64;
 
         let parse_start = Instant::now();
+        self.parse_counter.fetch_add(1, Ordering::SeqCst);
         let clean_id = id.trim().strip_suffix(".md").unwrap_or(id.trim());
         let entity = Self::parse_markdown(clean_id, &raw)?;
         let markdown_parse_us = parse_start.elapsed().as_micros() as u64;
@@ -500,6 +591,7 @@ impl DocumentStore for LocalMarkdownDocumentStore {
                     e
                 ))
             })?;
+            self.parse_counter.fetch_add(1, Ordering::SeqCst);
             if let Ok(entity) = Self::parse_markdown(stem, &raw) {
                 docs.push(entity);
             }
@@ -507,6 +599,55 @@ impl DocumentStore for LocalMarkdownDocumentStore {
         docs.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(docs)
     }
+
+    fn list_document_metadata(&self) -> Result<Option<Vec<VaultFileMetadata>>, OmkError> {
+        let entries = fs::read_dir(&self.root_dir).map_err(|e| {
+            OmkError::InternalError(format!(
+                "Failed to read Vault directory '{}': {}",
+                self.root_dir.display(),
+                e
+            ))
+        })?;
+        let mut meta_list = Vec::new();
+        for entry_res in entries {
+            let entry = entry_res.map_err(|e| {
+                OmkError::InternalError(format!("Failed to read directory entry: {}", e))
+            })?;
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with('.') || !name_str.ends_with(".md") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let stem = name_str.strip_suffix(".md").unwrap_or(name_str);
+            let (file_mtime_ns, file_size) = extract_mtime_and_size(&meta);
+            meta_list.push(VaultFileMetadata {
+                id: stem.to_string(),
+                file_mtime_ns,
+                file_size,
+            });
+        }
+        meta_list.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(Some(meta_list))
+    }
+}
+
+fn extract_mtime_and_size(meta: &fs::Metadata) -> (i64, i64) {
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let size = meta.len().min(i64::MAX as u64) as i64;
+    (mtime_ns, size)
 }
 
 fn escape_yaml_str(s: &str) -> String {

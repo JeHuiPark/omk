@@ -13,6 +13,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,14 +46,14 @@ pub struct ProxyConfig {
     pub request_timeout: Duration,
     /// Maximum connection attempts using exponential backoff.
     pub max_connect_retries: u32,
-    /// Base backoff delay (doubled on each retry).
+    /// Base backoff delay in milliseconds (`REQ-PERF-001`: 5ms default, doubled on each retry).
     pub base_backoff_ms: u64,
     /// Whether to automatically spawn `omk daemon` in the background if the socket is unreachable.
     pub auto_spawn_daemon: bool,
 }
 
 impl ProxyConfig {
-    /// Creates a default [`ProxyConfig`] for `vault_dir` (30s timeout, 6 retries, auto-spawn enabled).
+    /// Creates a default [`ProxyConfig`] for `vault_dir` (30s timeout, 8 retries starting at 5ms, auto-spawn enabled).
     ///
     /// # Errors
     /// Returns [`OmkError::InternalError`] if resolving paths fails.
@@ -59,22 +61,47 @@ impl ProxyConfig {
         Ok(Self {
             paths: DaemonPaths::resolve(vault_dir)?,
             request_timeout: Duration::from_secs(30),
-            max_connect_retries: 6,
-            base_backoff_ms: 25,
+            max_connect_retries: 8,
+            base_backoff_ms: 5,
             auto_spawn_daemon: true,
         })
     }
 }
 
-/// Stdio-to-UDS MCP Proxy client.
+struct PersistentConnection {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+/// Stdio-to-UDS MCP Proxy client with persistent connection reuse (`REQ-PERF-001`, `MET-STATIC-01`).
 pub struct McpProxy {
     config: ProxyConfig,
+    connection: Mutex<Option<PersistentConnection>>,
+    connect_counter: AtomicUsize,
 }
 
 impl McpProxy {
     /// Constructs a new [`McpProxy`] with the provided [`ProxyConfig`].
     pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            connection: Mutex::new(None),
+            connect_counter: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns the cumulative number of Unix Domain Socket `connect()` calls established by this proxy
+    /// (`REQ-PERF-006`, `MET-STATIC-01`).
+    pub fn connect_count(&self) -> usize {
+        self.connect_counter.load(Ordering::SeqCst)
+    }
+
+    /// Resets the connection counter and closes any cached socket connection (`REQ-PERF-006`).
+    pub fn reset_counters(&self) {
+        self.connect_counter.store(0, Ordering::SeqCst);
+        if let Ok(mut guard) = self.connection.lock() {
+            *guard = None;
+        }
     }
 
     /// Connects to the running daemon over Unix Domain Socket, auto-spawning the background
@@ -88,14 +115,14 @@ impl McpProxy {
     }
 
     /// Connects to the running daemon and returns `(stream, proxy_connect_us, cold_start, connect_retries, backoff_wait_us)`
-    /// (`REQ-OBS-001`).
+    /// (`REQ-OBS-001`, `REQ-PERF-001`).
     ///
     /// # Errors
     /// Returns [`OmkError::DaemonUnreachable`] (`-32000`) if the daemon cannot be reached after all retries.
     pub fn connect_with_backoff_timed(&self) -> Result<(UnixStream, u64, bool, u32, u64), OmkError> {
         let connect_start = Instant::now();
         if let Ok(stream) = self.try_connect_once() {
-            let connect_us = connect_start.elapsed().as_micros() as u64;
+            let connect_us = (connect_start.elapsed().as_micros() as u64).max(1);
             return Ok((stream, connect_us, false, 0, 0));
         }
 
@@ -106,17 +133,17 @@ impl McpProxy {
             }
         }
 
-        let mut delay_ms = self.config.base_backoff_ms.max(5);
+        let mut delay_ms = self.config.base_backoff_ms.max(1);
         let mut backoff_wait_us = 0u64;
         for attempt in 0..self.config.max_connect_retries {
             let sleep_start = Instant::now();
             thread::sleep(Duration::from_millis(delay_ms));
             backoff_wait_us += sleep_start.elapsed().as_micros() as u64;
             if let Ok(stream) = self.try_connect_once() {
-                let connect_us = connect_start.elapsed().as_micros() as u64;
+                let connect_us = (connect_start.elapsed().as_micros() as u64).max(1);
                 return Ok((stream, connect_us, cold_start, attempt + 1, backoff_wait_us));
             }
-            delay_ms = (delay_ms * 2).min(1000);
+            delay_ms = (delay_ms * 2).min(800);
         }
 
         Err(OmkError::DaemonUnreachable(format!(
@@ -136,7 +163,18 @@ impl McpProxy {
         })?;
         let _ = stream.set_read_timeout(Some(self.config.request_timeout));
         let _ = stream.set_write_timeout(Some(self.config.request_timeout));
+        self.connect_counter.fetch_add(1, Ordering::SeqCst);
         Ok(stream)
+    }
+
+    fn build_persistent_connection(&self, stream: UnixStream) -> Result<PersistentConnection, OmkError> {
+        let reader_stream = stream.try_clone().map_err(|e| {
+            OmkError::DaemonUnreachable(format!("Failed to clone UnixStream for reader: {}", e))
+        })?;
+        Ok(PersistentConnection {
+            writer: stream,
+            reader: BufReader::new(reader_stream),
+        })
     }
 
     fn spawn_background_daemon(&self) -> Result<(), OmkError> {
@@ -163,8 +201,9 @@ impl McpProxy {
         self.forward_line_timed(raw_line).0
     }
 
-    /// Sends a single JSON-RPC line to the daemon and returns both the optional response line
-    /// and [`ProxyCallTimings`] (`REQ-OBS-001`).
+    /// Sends a single JSON-RPC line to the daemon over a persistent UDS session connection
+    /// (transparently reconnecting once if the cached stream is broken) and returns both
+    /// the optional response line and [`ProxyCallTimings`] (`REQ-OBS-001`, `REQ-PERF-001`, `MET-STATIC-01`).
     pub fn forward_line_timed(&self, raw_line: &str) -> (Option<String>, ProxyCallTimings) {
         let total_start = Instant::now();
         let trace_id = next_trace_id();
@@ -190,78 +229,119 @@ impl McpProxy {
             parsed_req.id.is_none() || parsed_req.method.starts_with("notifications/");
         let req_id = parsed_req.id.clone();
 
-        let mut stream = match self.connect_with_backoff_timed() {
-            Ok((s, connect_us, cold_start, retries, backoff_us)) => {
-                timings.proxy_connect_us = connect_us;
-                timings.cold_start = cold_start;
-                timings.connect_retries = retries;
-                timings.backoff_wait_us = backoff_us;
-                s
+        let mut conn_guard = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for attempt in 0..2 {
+            let using_cached = conn_guard.is_some();
+            if !using_cached {
+                match self.connect_with_backoff_timed() {
+                    Ok((s, connect_us, cold_start, retries, backoff_us)) => {
+                        timings.proxy_connect_us = connect_us;
+                        timings.cold_start = cold_start;
+                        timings.connect_retries = retries;
+                        timings.backoff_wait_us = backoff_us;
+                        match self.build_persistent_connection(s) {
+                            Ok(pc) => *conn_guard = Some(pc),
+                            Err(err) => {
+                                timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                                return if is_notification {
+                                    (None, timings)
+                                } else {
+                                    (Some(format_rpc_error(req_id, &err)), timings)
+                                };
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                        return if is_notification {
+                            (None, timings)
+                        } else {
+                            (Some(format_rpc_error(req_id, &err)), timings)
+                        };
+                    }
+                }
             }
-            Err(err) => {
+
+            let pre_send_us = total_start.elapsed().as_micros() as u64;
+            let payload_to_send = inject_proxy_context(
+                trimmed,
+                &trace_id,
+                trimmed.len(),
+                timings.proxy_connect_us,
+                timings.cold_start,
+                timings.connect_retries,
+                timings.backoff_wait_us,
+                pre_send_us,
+            );
+
+            let ipc_start = Instant::now();
+            let pc = conn_guard.as_mut().expect("persistent connection active");
+            if let Err(e) = writeln!(pc.writer, "{}", payload_to_send).and_then(|_| pc.writer.flush()) {
+                *conn_guard = None;
+                if using_cached && attempt == 0 {
+                    continue;
+                }
+                timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
                 timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                let err = OmkError::DaemonUnreachable(format!(
+                    "Daemon Unreachable: failed to write request to daemon socket: {}",
+                    e
+                ));
                 return if is_notification {
                     (None, timings)
                 } else {
                     (Some(format_rpc_error(req_id, &err)), timings)
                 };
             }
-        };
 
-        let pre_send_us = total_start.elapsed().as_micros() as u64;
-        let payload_to_send = inject_proxy_context(
-            trimmed,
-            &trace_id,
-            trimmed.len(),
-            timings.proxy_connect_us,
-            timings.cold_start,
-            timings.connect_retries,
-            timings.backoff_wait_us,
-            pre_send_us,
-        );
+            if is_notification {
+                timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
+                timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                return (None, timings);
+            }
 
-        let ipc_start = Instant::now();
-        if let Err(e) = writeln!(stream, "{}", payload_to_send).and_then(|_| stream.flush()) {
-            timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
-            timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
-            let err = OmkError::DaemonUnreachable(format!(
-                "Daemon Unreachable: failed to write request to daemon socket: {}",
-                e
-            ));
-            return if is_notification {
-                (None, timings)
-            } else {
-                (Some(format_rpc_error(req_id, &err)), timings)
-            };
+            let mut resp = String::new();
+            match pc.reader.read_line(&mut resp) {
+                Ok(0) => {
+                    *conn_guard = None;
+                    if using_cached && attempt == 0 {
+                        continue;
+                    }
+                    timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
+                    timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                    let err = OmkError::DaemonUnreachable(
+                        "Daemon Unreachable: connection closed before response".to_string(),
+                    );
+                    return (Some(format_rpc_error(req_id, &err)), timings);
+                }
+                Ok(_) => {
+                    timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
+                    timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                    return (Some(resp.trim().to_string()), timings);
+                }
+                Err(e) => {
+                    *conn_guard = None;
+                    if using_cached && attempt == 0 {
+                        continue;
+                    }
+                    timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
+                    timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
+                    let err = OmkError::DaemonUnreachable(format!(
+                        "Daemon Unreachable or Timeout waiting for response: {}",
+                        e
+                    ));
+                    return (Some(format_rpc_error(req_id, &err)), timings);
+                }
+            }
         }
 
-        if is_notification {
-            timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
-            timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
-            return (None, timings);
-        }
-
-        let mut reader = BufReader::new(stream);
-        let mut resp = String::new();
-        let outcome = match reader.read_line(&mut resp) {
-            Ok(0) => {
-                let err = OmkError::DaemonUnreachable(
-                    "Daemon Unreachable: connection closed before response".to_string(),
-                );
-                Some(format_rpc_error(req_id, &err))
-            }
-            Ok(_) => Some(resp.trim().to_string()),
-            Err(e) => {
-                let err = OmkError::DaemonUnreachable(format!(
-                    "Daemon Unreachable or Timeout waiting for response: {}",
-                    e
-                ));
-                Some(format_rpc_error(req_id, &err))
-            }
-        };
-        timings.ipc_roundtrip_us = ipc_start.elapsed().as_micros() as u64;
         timings.proxy_total_us = total_start.elapsed().as_micros() as u64;
-        (outcome, timings)
+        let err = OmkError::DaemonUnreachable("Daemon Unreachable after reconnect".to_string());
+        (Some(format_rpc_error(req_id, &err)), timings)
     }
 
     /// Runs the blocking Stdio event loop (`stdin` -> UDS -> `stdout`).
