@@ -1,7 +1,7 @@
-//! Lightweight Stdio Proxy (`omk mcp`, `EPIC-IPC-01` §3.1).
+//! Lightweight Session Proxy (`omk mcp`, `EPIC-IPC-01` §3.1).
 //!
-//! Forwards JSON-RPC / MCP frames from `stdin` to the global `omk daemon` over a Unix Domain
-//! Socket and writes responses to `stdout`. Includes auto-spawning of the background daemon,
+//! Forwards JSON-RPC / MCP frames from `stdin` to the Vault Server (`omk daemon`) over a Unix Domain
+//! Socket and writes responses to `stdout`. Includes auto-spawning of the Vault Server,
 //! exponential backoff connection retry, and strict socket deadlines (timeouts) returning
 //! `-32000 (Daemon Unreachable)`.
 
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// End-to-End proxy span timings captured during a single [`McpProxy`] forwarding operation (`REQ-OBS-001`).
+/// End-to-End Session Proxy span timings captured during a single [`McpProxy`] forwarding operation (`REQ-OBS-001`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyCallTimings {
     /// Unique trace identifier assigned to the forwarded request.
@@ -37,10 +37,10 @@ pub struct ProxyCallTimings {
     pub proxy_total_us: u64,
 }
 
-/// Configuration for the Stdio [`McpProxy`].
+/// Configuration for the Session Proxy ([`McpProxy`]).
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
-    /// Resolved daemon/vault paths.
+    /// Resolved Vault Server and Vault paths.
     pub paths: DaemonPaths,
     /// Per-request read/write timeout (default: 30 seconds).
     pub request_timeout: Duration,
@@ -48,7 +48,7 @@ pub struct ProxyConfig {
     pub max_connect_retries: u32,
     /// Base backoff delay in milliseconds (`REQ-PERF-001`: 5ms default, doubled on each retry).
     pub base_backoff_ms: u64,
-    /// Whether to automatically spawn `omk daemon` in the background if the socket is unreachable.
+    /// Whether to automatically spawn the Vault Server (`omk daemon`) in the background if the socket is unreachable.
     pub auto_spawn_daemon: bool,
 }
 
@@ -73,7 +73,7 @@ struct PersistentConnection {
     reader: BufReader<UnixStream>,
 }
 
-/// Stdio-to-UDS MCP Proxy client with persistent connection reuse (`REQ-PERF-001`, `MET-STATIC-01`).
+/// Session Proxy (`omk mcp`) Stdio-to-UDS client with persistent connection reuse (`REQ-PERF-001`, `MET-STATIC-01`).
 pub struct McpProxy {
     config: ProxyConfig,
     connection: Mutex<Option<PersistentConnection>>,
@@ -104,21 +104,21 @@ impl McpProxy {
         }
     }
 
-    /// Connects to the running daemon over Unix Domain Socket, auto-spawning the background
-    /// daemon and retrying with exponential backoff if needed (`REQ-IPC-001`, `REQ-IPC-003`).
+    /// Connects to the running Vault Server (`omk daemon`) over Unix Domain Socket, auto-spawning
+    /// it in the background and retrying with exponential backoff if needed (`REQ-IPC-001`, `REQ-IPC-003`).
     ///
     /// # Errors
-    /// Returns [`OmkError::DaemonUnreachable`] (`-32000`) if the daemon cannot be reached after all retries.
+    /// Returns [`OmkError::DaemonUnreachable`] (`-32000`) if the Vault Server cannot be reached after all retries.
     pub fn connect_with_backoff(&self) -> Result<UnixStream, OmkError> {
         let (stream, _, _, _, _) = self.connect_with_backoff_timed()?;
         Ok(stream)
     }
 
-    /// Connects to the running daemon and returns `(stream, proxy_connect_us, cold_start, connect_retries, backoff_wait_us)`
+    /// Connects to the running Vault Server (`omk daemon`) and returns `(stream, proxy_connect_us, cold_start, connect_retries, backoff_wait_us)`
     /// (`REQ-OBS-001`, `REQ-PERF-001`).
     ///
     /// # Errors
-    /// Returns [`OmkError::DaemonUnreachable`] (`-32000`) if the daemon cannot be reached after all retries.
+    /// Returns [`OmkError::DaemonUnreachable`] (`-32000`) if the Vault Server cannot be reached after all retries.
     pub fn connect_with_backoff_timed(&self) -> Result<(UnixStream, u64, bool, u32, u64), OmkError> {
         let connect_start = Instant::now();
         if let Ok(stream) = self.try_connect_once() {
@@ -195,13 +195,13 @@ impl McpProxy {
         Ok(())
     }
 
-    /// Sends a single JSON-RPC line to the daemon and returns the optional response line.
-    /// Never panics; if the daemon is unreachable or times out, formats a `-32000` JSON-RPC error response.
+    /// Sends a single JSON-RPC line to the Vault Server (`omk daemon`) and returns the optional response line.
+    /// Never panics; if the Vault Server is unreachable or times out, formats a `-32000` JSON-RPC error response.
     pub fn forward_line(&self, raw_line: &str) -> Option<String> {
         self.forward_line_timed(raw_line).0
     }
 
-    /// Sends a single JSON-RPC line to the daemon over a persistent UDS session connection
+    /// Sends a single JSON-RPC line to the Vault Server (`omk daemon`) over a persistent UDS session connection
     /// (transparently reconnecting once if the cached stream is broken) and returns both
     /// the optional response line and [`ProxyCallTimings`] (`REQ-OBS-001`, `REQ-PERF-001`, `MET-STATIC-01`).
     pub fn forward_line_timed(&self, raw_line: &str) -> (Option<String>, ProxyCallTimings) {

@@ -3,7 +3,7 @@
 ## 1. Introduction
 
 ### 1.1 Purpose
-본 스펙은 [`EPIC-OBS-01`](EPIC-OBS-01.md)을 통해 구축된 실행 관측성 인프라와 6대 병목 진단 결과를 바탕으로, 실제 파워 유저의 장기 사용 조건(**주 5일, 일 8시간, 시간당 평균 10 사용자 턴**)에서 `omk` 시스템이 일관된 저지연(Low-Latency) 응답성과 높은 검색 회수율(Recall)을 유지하도록 **코어 및 데몬/프록시 아키텍처의 성능 개선 요구사항**을 정의합니다.
+본 스펙은 [`EPIC-OBS-01`](EPIC-OBS-01.md)을 통해 구축된 실행 관측성 인프라와 6대 병목 진단 결과를 바탕으로, 실제 파워 유저의 장기 사용 조건(**주 5일, 일 8시간, 시간당 평균 10 사용자 턴**)에서 `omk` 시스템이 일관된 저지연(Low-Latency) 응답성과 높은 검색 회수율(Recall)을 유지하도록 **코어 및 Vault Server / Session Proxy 아키텍처의 성능 개선 요구사항**을 정의합니다.
 
 특히 CI/CD 환경이나 개발자 로컬 머신의 일시적인 CPU/디스크 부하에 따라 흔들리는 단순 벽시계 시간(Wall-clock Time) 측정의 한계를 극복하기 위해, **코드 및 아키텍처 수준에서 결정론적으로 카운팅하고 단언(Assert)할 수 있는 정적/구조적 복잡도 지표(Static & Invariant Complexity Metrics)**와 **1년 치 누적 금고 규모를 재현하는 합성 워크로드 벤치마크 SLA(Synthetic Workload Benchmark SLAs)**를 함께 명세합니다.
 
@@ -11,8 +11,8 @@
 - **가상 조건 기반 정량 워크로드 모델링 (Quantitative Workload Modeling):** 주 5일 × 일 8시간 × 시간당 10턴 조건에서의 일/주/월/연간 RPC 트래픽, 도구별 호출 분포, 로컬 금고(Vault) 문서 및 SQLite 인덱스 증가 수식 도출.
 - **정적/결정론적 성능 지표 (Static & Deterministic Metrics) 정의:** 하드웨어 속도와 무관하게 $O(1)$ 또는 상한 상수($C$)로 검증 가능한 시스템 콜, 소켓 연결, DB 핸들 오픈, 트랜잭션 횟수, 파일 스캔 복잡도 불변식(Invariants) 정의.
 - **6대 지연 병목 구간의 구조적 해소 요구사항 (`REQ-PERF-001` ~ `REQ-PERF-005`):**
-  1. 프록시(`omk mcp`) 세션 내 영속 UDS 연결 재사용 및 데몬(`omk daemon`) 이벤트 기반 블로킹 `accept` 루프 전환(15ms 폴링 슬립 지터 제거).
-  2. 데몬 콜드 스타트 시 소켓 선(先) 바인딩(Fast-Bind) 및 증분 메타데이터(`mtime`/`size`) 기반 백그라운드 `reconcile` + 배치 트랜잭션 인덱싱.
+  1. Session Proxy(`omk mcp`) 세션 내 영속 UDS 연결 재사용 및 Vault Server(`omk daemon`) 이벤트 기반 블로킹 `accept` 루프 전환(15ms 폴링 슬립 지터 제거).
+  2. Vault Server(`omk daemon`) 콜드 스타트 시 소켓 선(先) 바인딩(Fast-Bind) 및 증분 메타데이터(`mtime`/`size`) 기반 백그라운드 `reconcile` + 배치 트랜잭션 인덱싱.
   3. SQLite Reader 커넥션 재사용(Pool/Thread-Local) 및 SQL 푸시다운 필터링(`WHERE` 절 조건 위임)을 통한 후처리 JSON 파싱 제거.
   4. 다중 키워드 검색 시 Zero-Hit 방지를 위한 2단계 자동 `OR` 폴백(BM25 랭킹 기반).
   5. 쓰기 파이프라인(`upsert_knowledge`) 내 불필요한 중복 파일 읽기/직렬화 최소화 및 내구성(Durability) 정책 제어.
@@ -27,10 +27,10 @@
 
 ### 1.4 References
 - [`CONSTITUTION.md`](../../../CONSTITUTION.md) : Environment Isolation, Core Isolation, Zero Heavy Dependencies 원칙
-- [`docs/architecture.md`](../../architecture.md) : Daemon & Proxy 통신 구조 및 CQRS AI Memory Pipeline 아키텍처
+- [`docs/architecture.md`](../../architecture.md) : Vault Server & Session Proxy 통신 구조 및 CQRS AI Memory Pipeline 아키텍처
 - [`docs/requirements/glossary.md`](../glossary.md) : 프로젝트 용어 사전 및 도메인 경계
 - [`docs/requirements/features/EPIC-OBS-01.md`](EPIC-OBS-01.md) : 프라이버시 보호 기반 실행 관측성 및 6대 지연 후보 구간 진단 (`DEF-OBS-01` ~ `DEF-OBS-06`)
-- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 데몬/프록시 생명주기
+- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 Vault Server & Session Proxy 생명주기
 - [`docs/requirements/features/EPIC-SEARCH-01.md`](EPIC-SEARCH-01.md) : 지식 검색 및 SQLite FTS5 인덱싱 명세
 - [`docs/requirements/features/EPIC-VAULT-01.md`](EPIC-VAULT-01.md) : Markdown 기반 영구 지식 저장소 명세
 
@@ -73,9 +73,9 @@ T_{\text{year}} &= 250 \text{ days/year} \times 80 \text{ turns/day} = 20,000 \t
 | **1년 차 ($d = 250$)** | 20,000 턴 | 5,000 회 | **3,000 개** | $4.5\text{ KB}$ | $\sim 13.5\text{ MB}$ | $\sim 20.0\text{ MB}$ | 3,000개 `.md` 전체 읽기 + 3,000개 JSON 파싱 ($\sim 450\text{ ms}$) |
 | **파워 유저 상한 ($1\text{년 Max}$)** | 20,000 턴 | 5,000 회 ($\alpha_{\text{new}}=1.0$) | **5,000 개** | $5.0\text{ KB}$ | $\sim 25.0\text{ MB}$ | $\sim 35.0\text{ MB}$ | 5,000개 `.md` 전체 읽기 + 5,000개 JSON 파싱 ($\sim 800\text{ ms+}$) |
 
-#### 2.1.4 하루 8시간 근무 중 데몬 기동 및 유휴(Lifecycle) 패턴
-- **콜드 스타트(Cold Start) 빈도:** 사용자는 출근 직후 첫 AI 세션 시작 시 1회, 그리고 오후 중 IDE 재시작/브랜치 전환/수동 종료 등으로 하루 평균 **2~5회**의 데몬 콜드 스타트를 경험합니다.
-- **프록시 세션 지속 시간:** 한 번 열린 AI 에이전트 하네스(`omk mcp` 서브프로세스)는 평균 **1~4시간** 동안 유지되며, 단일 프록시 프로세스 수명 동안 평균 **25~60회의 연속 RPC 요청**을 포워딩합니다.
+#### 2.1.4 하루 8시간 근무 중 Vault Server 기동 및 유휴(Lifecycle) 패턴
+- **콜드 스타트(Cold Start) 빈도:** 사용자는 출근 직후 첫 AI 세션 시작 시 1회, 그리고 오후 중 IDE 재시작/브랜치 전환/수동 종료 등으로 하루 평균 **2~5회**의 Vault Server(`omk daemon`) 콜드 스타트를 경험합니다.
+- **Session Proxy 지속 시간:** 한 번 열린 AI 에이전트 하네스(Session Proxy, `omk mcp`)는 평균 **1~4시간** 동안 유지되며, 단일 프록시 프로세스 수명 동안 평균 **25~60회의 연속 RPC 요청**을 포워딩합니다.
 
 ---
 
@@ -120,7 +120,7 @@ T_{\text{year}} &= 250 \text{ days/year} \times 80 \text{ turns/day} = 20,000 \t
 | **`search_knowledge` (E2E Warm)** | 키워드 1~4개 + 필터 조합 (일 60회 분포) | **$\le 1.5\text{ ms}$** | **$\le 4.0\text{ ms}$** | **$\le 8.0\text{ ms}$** | `omk bench` / `omk stats` |
 | **`read_knowledge` (E2E Warm)** | 단건 마크다운 조회 (일 40회 분포, 평균 $4.5\text{ KB}$) | **$\le 0.8\text{ ms}$** | **$\le 2.5\text{ ms}$** | **$\le 5.0\text{ ms}$** | `omk bench` / `omk stats` |
 | **`upsert_knowledge` (E2E Warm)** | 신규 생성 60% + 기존 갱신 40% (일 20회 분포) | **$\le 4.0\text{ ms}$** | **$\le 12.0\text{ ms}$** | **$\le 25.0\text{ ms}$** | `omk bench` / `omk stats` |
-| **Daemon Cold Start Ready Time** | 데몬 미구동 상태에서 첫 요청 도착 ~ 소켓 연결 완료 | **$\le 25.0\text{ ms}$** | **$\le 50.0\text{ ms}$** | **$\le 80.0\text{ ms}$** | `omk bench` |
+| **Vault Server Cold Start Ready Time** | Vault Server(`omk daemon`) 미구동 상태에서 첫 요청 도착 ~ 소켓 연결 완료 | **$\le 25.0\text{ ms}$** | **$\le 50.0\text{ ms}$** | **$\le 80.0\text{ ms}$** | `omk bench` |
 | **Incremental `reconcile` (No-op)** | $N = 3,000$개 문서가 모두 최신 상태일 때 정합성 대사 | **$\le 15.0\text{ ms}$** | **$\le 30.0\text{ ms}$** | **$\le 50.0\text{ ms}$** | `omk bench` |
 | **Full Rebuild `reconcile` (Cold Index)** | `index.db` 삭제 후 $N = 3,000$개 문서 전체 재인덱싱 | **$\le 400\text{ ms}$** | **$\le 800\text{ ms}$** | **$\le 1,200\text{ ms}$** | `omk bench` |
 | **일일 80턴(120 RPC) 총 누적 시스템 시간** | 하루치 120회 RPC 호출의 순수 `omk` 소요 시간 총합 | **$\le 300\text{ ms}$ / day** | **$\le 600\text{ ms}$ / day** | **$\le 1,000\text{ ms}$ / day** | `omk bench` (8시간 업무 중 1초 미만) |

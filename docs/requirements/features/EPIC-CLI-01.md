@@ -5,10 +5,10 @@
 본 스펙은 인간 사용자(Human User)가 터미널에서 `omk CLI`를 실행할 때 겪는 사용성 결함(무응답 대기 현상, 비직관적인 Raw JSON 출력, 상태 확인 수단 부재, 인자 오타 무시 현상)을 해결하고, 다양한 AI 에이전트 하네스(AI Agent Harness) 환경을 자동으로 탐지하거나 명시적으로 지정하여 `omk Skill` 및 MCP 서버 설정을 안전하게 프로비저닝(Provisioning)하는 표준 동작을 정의합니다.
 
 ### 1.2 Scope
-- 터미널(TTY) 인터랙티브 실행 감지 및 기본 진입 동작(Help / Status 안내 vs Stdio MCP Proxy) 제어.
+- 터미널(TTY) 인터랙티브 실행 감지 및 기본 진입 동작(Help / Status 안내 vs Session Proxy) 제어.
 - 인간 친화적(Human-Readable) 포맷 출력과 머신/스크립트 친화적(`--json`) 출력 모드의 이원화.
 - 명령줄 인자(Subcommand, Flag) 엄격 검증 및 친절한 오류/가이드 메시지 제공.
-- 시스템, 데몬, 로컬 금고(Vault), 하네스 설치 현황을 진단하는 `omk status` 명령어.
+- 시스템, Vault Server(`omk daemon`), 로컬 금고(Vault), 하네스 설치 현황을 진단하는 `omk status` 명령어.
 - 주요 AI 에이전트 하네스(Claude Code, Claude Desktop, Cursor, Antigravity/Gemini CLI, Codex, OpenCode, Windsurf) 자동 탐지(Auto-detection) 및 `--harness` 타겟 프로비저닝 옵션.
 - 기존 하네스 설정 파일의 비파괴적 병합(Non-destructive Config Merge) 보장.
 
@@ -21,7 +21,7 @@
 ### 1.4 References
 - [`CONSTITUTION.md`](../../../CONSTITUTION.md) : Agent-Agnostic(에이전트 범용성) 및 Environment Isolation(환경 독립성) 원칙
 - [`docs/requirements/glossary.md`](../glossary.md) : 프로젝트 용어 사전 및 도메인 경계
-- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 데몬/프록시 생명주기
+- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 Vault Server & Session Proxy 생명주기
 
 ---
 
@@ -60,7 +60,7 @@
   - *Response 3:* 무시하거나 `mcp`로 폴백하지 않고, 즉시 잘못된 인자를 지적하는 에러 메시지와 유사 명령어 제안 또는 `omk --help` 안내를 `stderr`에 출력한 뒤 비정상 종료 코드(`2` 또는 `1`)로 종료함.
 - **3.1.3 Functional Requirements:**
   - 시스템은 `stdin`이 인터랙티브 터미널(TTY)인지 판별해야 하며, TTY 환경에서 서브커맨드 없이 `omk`가 단독 실행될 경우 블로킹 대기 없이 도움말 및 빠른 시작 가이드(`omk install`, `omk status` 안내)를 출력해야 한다.
-  - 명시적으로 `omk mcp`가 호출된 경우, 만약 `stdin`이 TTY라면 `stderr`에 `"Starting omk MCP stdio proxy (waiting for JSON-RPC input on stdin... Press Ctrl+C to exit)"` 안내 문구를 1회 출력하여 사용자가 프로세스 멈춤으로 오인하지 않도록 해야 한다 (`stdout`은 프로토콜 보호를 위해 오염시키지 않는다).
+  - 명시적으로 `omk mcp`가 호출된 경우, 만약 `stdin`이 TTY라면 `stderr`에 `"[omk] Starting MCP Session Proxy (waiting for JSON-RPC input on stdin... Press Ctrl+C to exit)"` 안내 문구를 1회 출력하여 사용자가 프로세스 멈춤으로 오인하지 않도록 해야 한다 (`stdout`은 프로토콜 보호를 위해 오염시키지 않는다).
   - CLI 파서는 다음 서브커맨드와 전역/지역 플래그를 명확히 식별하고, 정의되지 않은 위치 인자나 플래그 입력 시 즉시 오류를 반환해야 한다:
     - 서브커맨드: `install`, `status`, `reconcile`, `stop`, `mcp`, `daemon`, `help`
     - 플래그: `--vault <dir>` (`-v`), `--harness <names>` (`-H`), `--target <dir>` (`-t`), `--json`, `--version` (`-V`), `--help` (`-h`)
@@ -86,14 +86,14 @@
     - `--json` 모드 또는 `omk mcp` 실행 중에는 기존 표준 JSON / JSON-RPC 2.0 에러 포맷(`EPIC-IPC-01` `REQ-IPC-003`)을 유지해야 한다.
 
 ### 3.3 REQ-CLI-003: 시스템 및 하네스 상태 진단 명령어 (`omk status`)
-- **3.3.1 Description and Priority:** 높은 우선순위. 사용자가 로컬 금고, 백그라운드 데몬, 그리고 각 AI 에이전트 하네스의 연동 상태를 한눈에 진단할 수 있도록 합니다.
+- **3.3.1 Description and Priority:** 높은 우선순위. 사용자가 로컬 금고, Vault Server(`omk daemon`), 그리고 각 AI 에이전트 하네스의 연동 상태를 한눈에 진단할 수 있도록 합니다.
 - **3.3.2 Stimulus/Response Sequences:**
   - *Stimulus:* 사용자가 `omk status [--vault <dir>] [--json]`를 실행함.
-  - *Response:* Vault 경로 및 문서/인덱스 현황, 데몬 실행 상태(PID, 소켓 응답 여부), 로컬에 감지된 AI 하네스별 프로비저닝 상태를 출력함.
+  - *Response:* Vault 경로 및 문서/인덱스 현황, Vault Server 실행 상태(PID, 소켓 응답 여부), 로컬에 감지된 AI 하네스별 프로비저닝 상태를 출력함.
 - **3.3.3 Functional Requirements:**
-  - `omk status`는 데몬을 강제로 자동 기동(Auto-spawn)하지 않고 현재 상태를 비파괴적(Read-only)으로 점검해야 한다:
+  - `omk status`는 Vault Server를 강제로 자동 기동(Auto-spawn)하지 않고 현재 상태를 비파괴적(Read-only)으로 점검해야 한다:
     1. **Vault 상태:** 해석된 Vault 디렉터리 절대 경로, 디렉터리 존재 여부, 저장된 마크다운(`.md`) 문서 수, SQLite 인덱스 DB(`index.db`) 존재 여부 및 인덱싱된 문서 수.
-    2. **Daemon 상태:** `daemon.pid` 파일 및 `flock` / Unix Domain Socket(`daemon.sock`) 연결 및 `ping` 응답 여부를 확인하여 `Running (PID: <pid>, Socket: <path>)` 또는 `Stopped` 상태를 표시해야 한다.
+    2. **Vault Server (`omk daemon`) 상태:** `daemon.pid` 파일 및 `flock` / Unix Domain Socket(`daemon.sock`) 연결 및 `ping` 응답 여부를 확인하여 `Running (PID: <pid>, Socket: <path>)` 또는 `Stopped` 상태를 표시해야 한다.
     3. **Harness 상태:** 지원 대상 유명 하네스(`REQ-CLI-004`) 각각에 대해 로컬 감지 여부(`Detected` / `Not Found`)와 `omk` MCP/Skill 설정 등록 여부(`Configured` / `Not Configured`)를 표 또는 리스트 형태로 출력해야 한다.
   - `--json` 플래그 사용 시 위 진단 정보를 구조화된 JSON(`{"vault":{...},"daemon":{...},"harnesses":[...]}`)으로 반환해야 한다.
 
@@ -108,7 +108,7 @@
 | 하네스 식별자 (`--harness`) | 대상 제품명 | 로컬 설치 탐지 기준 (Detection Condition) | MCP 설정 파일 경로 (MCP Config Target) | 스킬 지침 경로 (Skill / Rule Target) |
 | :--- | :--- | :--- | :--- | :--- |
 | **`claude-code`** | Anthropic Claude Code CLI | `~/.claude` 디렉터리 또는 `~/.claude.json` 파일 존재 (또는 `PATH` 내 `claude` 바이너리 존재) | `~/.claude.json` (`mcpServers.omk`) | `~/.claude/skills/omk/SKILL.md` |
-| **`claude-desktop`** | Anthropic Claude Desktop | OS별 Claude 앱 설정 디렉터리 존재:<br>- macOS: `~/Library/Application Support/Claude`<br>- Linux: `~/.config/Claude`<br>- Windows: `%APPDATA%\Claude` | `<AppSupport>/Claude/claude_desktop_config.json` (`mcpServers.omk`) | N/A (글로벌 공용 `~/.omk/skills/omk/SKILL.md` 생성) |
+| **`claude-desktop`** | Anthropic Claude Desktop | OS별 Claude 앱 설정 디렉터리 존재:<br>- macOS: `~/Library/Application Support/Claude`<br>- Linux: `~/.config/Claude`<br>- Windows: `%APPDATA%\Claude` | `<AppSupport>/Claude/claude_desktop_config.json` (`mcpServers.omk`) | N/A (공용 `~/.omk/skills/omk/SKILL.md` 생성) |
 | **`cursor`** | Cursor IDE | `~/.cursor` 디렉터리 존재 | `~/.cursor/mcp.json` (`mcpServers.omk`) | `~/.cursor/skills/omk/SKILL.md` |
 | **`gemini`**<br>*(별칭: `antigravity`, `agy`)* | Google Antigravity / Gemini CLI | `~/.gemini` 디렉터리 존재 | `~/.gemini/config/mcp_config.json` 및 `~/.gemini/settings.json` (`mcpServers.omk`) | `~/.gemini/skills/omk/SKILL.md` |
 | **`codex`** | OpenAI Codex CLI | `~/.codex` 디렉터리 존재 (또는 `PATH` 내 `codex` 바이너리 존재) | `~/.codex/mcp_config.json` (및 `~/.codex/config.toml` 안내/스니펫) | `~/.codex/skills/omk/SKILL.md` |
@@ -140,7 +140,7 @@
     - `all`: 감지 여부와 무관하게 현재 OS에서 지원 가능한 모든 유명 하네스의 설정 경로를 생성 및 프로비저닝한다.
     - 개별 하네스 식별자 및 쉼표(`,`) 구분 목록: `claude-code`, `claude-desktop`, `cursor`, `gemini` (별칭 `antigravity`, `agy`), `codex`, `opencode`, `windsurf`. 대소문자를 구분하지 않고(Case-insensitive) 매칭해야 한다.
   - 사용자가 특정 하네스를 명시적으로 지정(`--harness <name>`)한 경우, 해당 하네스의 기본 디렉터리가 아직 존재하지 않아도 디렉터리를 생성(`mkdir -p`)하여 프로비저닝을 완수해야 한다.
-  - 기존 `--target <dir>` (`-t <dir>`) 옵션은 커스텀 경로에 `SKILL.md`와 `mcp_config.json`을 직접 출력하는 용도로 완전한 하위 호환성을 유지해야 하며, `--target`만 단독 지정된 경우 글로벌 하네스 설정 파일들을 임의로 변경하지 않아야 한다(격리된 테스트 및 커스텀 배포 보장).
+  - 기존 `--target <dir>` (`-t <dir>`) 옵션은 커스텀 경로에 `SKILL.md`와 `mcp_config.json`을 직접 출력하는 용도로 완전한 하위 호환성을 유지해야 하며, `--target`만 단독 지정된 경우 사용자 홈의 하네스 설정 파일들을 임의로 변경하지 않아야 한다(격리된 테스트 및 커스텀 배포 보장).
 
 ---
 

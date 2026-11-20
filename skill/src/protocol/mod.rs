@@ -29,16 +29,16 @@ pub fn next_trace_id() -> String {
     format!("{:016x}", mixed)
 }
 
-/// Proxy-side connection and retry span metadata attached or recorded per RPC call (`REQ-OBS-001`).
+/// Session Proxy connection and retry span metadata attached or recorded per RPC call (`REQ-OBS-001`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxySpanContext {
-    /// Trace identifier propagated from `omk mcp` proxy if present.
+    /// Trace identifier propagated from the Session Proxy (`omk mcp`) if present.
     pub trace_id: Option<String>,
     /// Original request byte length received on `stdin` before proxy framing.
     pub original_req_bytes: Option<usize>,
-    /// Time spent establishing the UDS connection to the daemon (`us`).
+    /// Time spent establishing the UDS connection to the Vault Server (`us`).
     pub proxy_connect_us: u64,
-    /// Whether `auto_spawn` was triggered due to a cold daemon start.
+    /// Whether `auto_spawn` was triggered due to a Vault Server cold start.
     pub cold_start: bool,
     /// Number of exponential backoff connection retries performed.
     pub connect_retries: u32,
@@ -113,7 +113,7 @@ pub struct RpcDispatchObservation {
     pub rpc_parse_us: u64,
     /// Time spent waiting for the CQRS `command_lock` mutex (`us`).
     pub lock_wait_us: u64,
-    /// Total execution time inside the daemon dispatcher (`us`).
+    /// Total execution time inside the Vault Server dispatcher (`us`).
     pub daemon_total_us: u64,
     /// Sub-stage timings inside `omk_core`.
     pub tool_timings: ToolTimings,

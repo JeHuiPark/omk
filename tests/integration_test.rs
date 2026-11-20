@@ -1,5 +1,5 @@
 //! End-to-End Integration Tests across Vault File System, SQLite FTS5 Index,
-//! Global Singleton Daemon, Stdio MCP Proxy, and CLI Multi-Harness UX (`EPIC-VAULT-01`,
+//! Vault Server (`omk daemon`), Session Proxy (`omk mcp`), and CLI Multi-Harness UX (`EPIC-VAULT-01`,
 //! `EPIC-DATA-01`, `EPIC-SEARCH-01`, `EPIC-IPC-01`, `EPIC-CLI-01`).
 
 use omk::agent_prompt::{
@@ -36,7 +36,7 @@ fn unique_test_dir(label: &str) -> PathBuf {
 }
 
 #[test]
-fn test_singleton_pid_lock_prevents_duplicate_daemon() {
+fn test_exclusive_pid_lock_prevents_duplicate_vault_server() {
     let vault_dir = unique_test_dir("pidlock");
     let cfg = DaemonConfig::new(&vault_dir).expect("config");
 
@@ -44,7 +44,7 @@ fn test_singleton_pid_lock_prevents_duplicate_daemon() {
     let second = PidLockGuard::acquire(&cfg.paths.pid_path);
     assert!(
         second.is_err(),
-        "Second daemon instance must be blocked by OS flock on daemon.pid"
+        "Second Vault Server instance must be blocked by OS flock on daemon.pid"
     );
 
     drop(_guard1);
@@ -400,7 +400,7 @@ fn test_cli_binary_ux_help_status_install_and_strict_error_handling() {
     assert!(status_out.status.success());
     let status_stdout = String::from_utf8_lossy(&status_out.stdout);
     assert!(status_stdout.contains("[Local Vault]"));
-    assert!(status_stdout.contains("[Background Daemon]"));
+    assert!(status_stdout.contains("[Vault Server]"));
     assert!(status_stdout.contains("[AI Agent Harnesses]"));
 
     let status_json_out = Command::new(bin)

@@ -2,7 +2,7 @@
 name = "omk"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone local knowledge vault skill and MCP daemon/proxy for AI agents"
+description = "Standalone local knowledge vault skill with MCP Vault Server and Session Proxy for AI agents"
 license = "MIT"
 
 [lib]

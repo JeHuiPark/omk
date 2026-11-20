@@ -24,7 +24,7 @@
       }
     },
     "ping": {
-      "description": "Health check between client, proxy, and daemon.",
+      "description": "Health check between client, Session Proxy (omk mcp), and Vault Server (omk daemon).",
       "params": {},
       "result": {}
     },

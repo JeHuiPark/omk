@@ -6,7 +6,7 @@
 
 ### 1.2 Scope
 - 현행 코드베이스(`proxy`, `daemon`, `protocol`, `search`, `vault`, `index`)의 지연 발생 후보 구간 및 로깅 한계 진단.
-- 프록시(`omk mcp`), 데몬(`omk daemon`), 코어 CQRS 파이프라인(`omk_core`) 전 구간에 걸친 End-to-End Trace & Span 지연 시간 계측 모델 정의.
+- Session Proxy(`omk mcp`), Vault Server(`omk daemon`), 코어 CQRS 파이프라인(`omk_core`) 전 구간에 걸친 End-to-End Trace & Span 지연 시간 계측 모델 정의.
 - AI 에이전트의 도구 활용 효율성 및 검색 품질 정량 지표(Zero-Hit 비율, 재질의 빈도, 페이로드 및 추정 토큰 크기 등) 정의.
 - 민감 정보(문서 본문, 제목, 검색어, 작성자, URI, OS 계정 경로 등)의 로그 노출을 원천 차단하는 마스킹/익명화(Redaction & Local Salted Hashing) 정책 및 100% 로컬 격리 저장 원칙 명세.
 - 구조화 로그/텔레메트리 파일의 무한 비대화를 방지하기 위한 로그 로테이션 및 보존(Log Rotation & Retention) 정책 정의.
@@ -15,16 +15,16 @@
 ### 1.3 Definitions, Acronyms, and Abbreviations
 - **End-to-End Latency (종단간 지연 시간):** AI 에이전트 하네스가 `omk mcp`의 `stdin`으로 JSON-RPC 요청 프레임을 전달한 시점부터 `stdout`으로 응답 프레임이 플러시(Flush)될 때까지 소요된 총 시간.
 - **Span (실행 구간):** 단일 요청 처리 과정 내부의 세부 작업 단위(예: 소켓 연결, 락 대기, 마크다운 `fsync`, SQLite FTS5 쿼리 등) 및 그 소요 시간(`_us`, 마이크로초).
-- **Cold Start (콜드 스타트):** 백그라운드 `omk daemon`이 실행 중이지 않아 `omk mcp` 프록시가 데몬을 자동 기동(`auto_spawn`)하고 초기 대사(`reconcile`) 및 소켓 바인딩이 완료될 때까지 지수적 백오프로 대기하는 현상.
+- **Cold Start (콜드 스타트):** 백그라운드 Vault Server(`omk daemon`)가 실행 중이지 않아 Session Proxy(`omk mcp`)가 서버를 자동 기동(`auto_spawn`)하고 초기 대사(`reconcile`) 및 소켓 바인딩이 완료될 때까지 지수적 백오프로 대기하는 현상.
 - **Zero-Hit Rate (무매칭 비율):** `search_knowledge` 호출 중 반환된 매칭 결과 수(`result_count`)가 `0`건인 요청의 비율로, 에이전트의 검색 실패 및 재시도 루프(Retry Churn)를 나타내는 핵심 지표.
 - **Local Salted Hash (로컬 솔트 단방향 해시):** 원문(문서 ID, 검색 질의어 등)을 노출하지 않으면서도 동일 대상에 대한 반복 접근 상관관계를 분석하기 위해 로컬 전용 난수 시드(Salt)를 결합하여 생성한 비가역 해시 식별자.
 - 기타 핵심 도메인 용어(`omk CLI`, `omk Skill`, `Local Vault` 등)는 [용어 사전 (Glossary)](../glossary.md)을 따릅니다.
 
 ### 1.4 References
 - [`CONSTITUTION.md`](../../../CONSTITUTION.md) : Environment Isolation(환경 독립성), Core Isolation(코어 격리), Zero Heavy Dependencies(외부 의존성 최소화) 원칙
-- [`docs/architecture.md`](../../architecture.md) : Daemon & Proxy 통신 구조 및 CQRS AI Memory Pipeline 아키텍처
+- [`docs/architecture.md`](../../architecture.md) : Vault Server & Session Proxy 통신 구조 및 CQRS AI Memory Pipeline 아키텍처
 - [`docs/requirements/glossary.md`](../glossary.md) : 프로젝트 용어 사전 및 도메인 경계
-- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 데몬/프록시 생명주기
+- [`docs/requirements/features/EPIC-IPC-01.md`](EPIC-IPC-01.md) : MCP 통신 프로토콜 및 Vault Server & Session Proxy 생명주기
 - [`docs/requirements/features/EPIC-CLI-01.md`](EPIC-CLI-01.md) : 인간 친화적 CLI 사용성 및 `omk status` 명세
 - [`docs/requirements/features/EPIC-SEARCH-01.md`](EPIC-SEARCH-01.md) : 지식 검색 및 SQLite FTS5 인덱싱 명세
 
@@ -39,8 +39,8 @@
 sequenceDiagram
     autonumber
     participant Agent as AI Agent Harness
-    participant Proxy as omk mcp (Stdio Proxy)
-    participant Daemon as omk daemon (UDS Server)
+    participant Proxy as omk mcp (Session Proxy)
+    participant Daemon as omk daemon (Vault Server)
     participant Core as KnowledgePipeline (CQRS)
     participant Storage as Vault (.md) & SQLite (FTS5)
 
@@ -93,8 +93,8 @@ sequenceDiagram
 
 | 계층 (Layer) | 대상 동작 / 메서드 | 필수 계측 Span 및 메트릭 필드 | 설명 |
 | :--- | :--- | :--- | :--- |
-| **1. Proxy Layer**<br>(`omk mcp`) | 모든 포워딩 요청 | `proxy_connect_us`<br>`cold_start` (`bool`)<br>`connect_retries` (`u32`)<br>`backoff_wait_us`<br>`ipc_roundtrip_us`<br>`proxy_total_us` | UDS 소켓 연결 소요 시간, 데몬 미구동으로 인한 `auto_spawn` 실행 여부, 백오프 재시도 횟수 및 슬립 대기 시간, 데몬 소켓 송수신 왕복 시간, 프록시 전체 처리 시간 (프록시가 요청 메타데이터 또는 경량 헤더/후속 보고를 통해 전달하거나 로컬 텔레메트리에 기록) |
-| **2. Daemon Layer**<br>(`omk daemon`, `McpDispatcher`) | 데몬 기동 및 모든 RPC 요청 | `startup_reconcile_us`<br>`in_flight` (`usize`)<br>`rpc_parse_us`<br>`lock_wait_us`<br>`daemon_total_us` | 기동 시 초기 `reconcile` 소요 시간, 요청 진입 시점의 동시 처리 중 요청 수, JSON-RPC 파싱 시간, 쓰기 명령 시 `command_lock` 획득 대기 시간, 데몬 내 총 실행 시간 |
+| **1. Session Proxy Layer**<br>(`omk mcp`) | 모든 포워딩 요청 | `proxy_connect_us`<br>`cold_start` (`bool`)<br>`connect_retries` (`u32`)<br>`backoff_wait_us`<br>`ipc_roundtrip_us`<br>`proxy_total_us` | UDS 소켓 연결 소요 시간, Vault Server 미구동으로 인한 `auto_spawn` 실행 여부, 백오프 재시도 횟수 및 슬립 대기 시간, 소켓 송수신 왕복 시간, 프록시 전체 처리 시간 (프록시가 요청 메타데이터 또는 경량 헤더/후속 보고를 통해 전달하거나 로컬 텔레메트리에 기록) |
+| **2. Vault Server Layer**<br>(`omk daemon`, `McpDispatcher`) | 서버 기동 및 모든 RPC 요청 | `startup_reconcile_us`<br>`in_flight` (`usize`)<br>`rpc_parse_us`<br>`lock_wait_us`<br>`daemon_total_us` | 기동 시 초기 `reconcile` 소요 시간, 요청 진입 시점의 동시 처리 중 요청 수, JSON-RPC 파싱 시간, 쓰기 명령 시 `command_lock` 획득 대기 시간, 서버 내 총 실행 시간 |
 | **3. Core Pipeline**<br>(`upsert_knowledge`) | 지식 생성/갱신 (Command) | `validate_read_us`<br>`vault_write_us`<br>`vault_fsync_us`<br>`index_write_us` | ID 정규화 + 기존 문서 조회 + 권위(`Authority`) 검증 시간, 마크다운 직렬화 및 임시 파일(`.tmp`) 쓰기/교체(`rename`) 시간, 디스크 강제 동기화(`sync_all`) 시간, SQLite 인덱스 트랜잭션(`knowledge_index` + `knowledge_fts`) 갱신 시간 |
 | **3. Core Pipeline**<br>(`search_knowledge`) | 지식 전문/필터 검색 (Query) | `fts_build_us`<br>`db_open_us`<br>`fts_query_us`<br>`filter_post_us` | 검색어 FTS5 쿼리 변환 시간, SQLite Reader 연결 및 PRAGMA 설정 시간, SQLite `prepare` + 첫/전체 `step` 실행 시간, 메타데이터 JSON 파싱 및 필터링/스니펫 합성 시간 |
 | **3. Core Pipeline**<br>(`read_knowledge`) | 단건 원문 조회 (Query) | `vault_read_us`<br>`markdown_parse_us` | 디스크에서 `.md` 파일을 읽어오는 I/O 시간, YAML Frontmatter 및 본문을 파싱하는 시간 |

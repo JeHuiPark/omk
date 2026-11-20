@@ -2,7 +2,7 @@
 
 [English](README.md) | **한국어**
 
-AI 에이전트를 위한 독립형 로컬 지식 금고(Standalone Local Knowledge Vault) 스킬 및 MCP 데몬/프록시입니다.
+AI 에이전트를 위한 독립형 로컬 지식 금고(Standalone Local Knowledge Vault) 스킬 및 MCP 볼트 서버(Vault Server)/세션 프록시(Session Proxy)입니다.
 
 ## 개요 (Overview)
 
@@ -21,7 +21,7 @@ make build
 # (claude-code, claude-desktop, cursor, gemini/antigravity, codex, opencode, windsurf, all)
 ./target/release/omk install --harness claude-code,cursor
 
-# 3. 로컬 금고(Vault), 백그라운드 데몬 및 하네스 연동 상태 진단
+# 3. 로컬 금고(Vault), 볼트 서버(Vault Server) 및 하네스 연동 상태 진단
 ./target/release/omk status
 ./target/release/omk stats
 ./target/release/omk bench --docs 3000 --turns 80
@@ -38,7 +38,7 @@ make build
 시스템 아키텍처, 프로토콜 규격 및 세부 요구사항 명세는 단일 진실 공급원(SSOT) 원칙에 따라 [`AGENTS.md`](AGENTS.md)에 등재된 아래 문서들을 참조하십시오:
 
 - [`CONSTITUTION.md`](CONSTITUTION.md): 프로젝트 헌법, 핵심 설계 원칙 및 거버넌스
-- [`docs/architecture.md`](docs/architecture.md): 데몬-프록시 IPC, CQRS 파이프라인 및 스토리지 격리 아키텍처
+- [`docs/architecture.md`](docs/architecture.md): Vault Server & Session Proxy IPC, CQRS 파이프라인 및 스토리지 격리 아키텍처
 - [`docs/protocol_spec.json`](docs/protocol_spec.json): MCP 및 JSON-RPC 2.0 도구 스키마 및 에러 규격
 - [`docs/requirements/index.md`](docs/requirements/index.md): 비즈니스 비전 및 기능별 상세 요구사항(`EPIC-*`) 진입점
 

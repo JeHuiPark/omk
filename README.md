@@ -2,7 +2,7 @@
 
 **English** | [한국어](README.ko.md)
 
-A standalone local knowledge vault skill and MCP daemon/proxy for AI agents.
+A standalone local knowledge vault skill with MCP Vault Server & Session Proxy for AI agents.
 
 ## Overview
 
@@ -21,7 +21,7 @@ make build
 # (claude-code, claude-desktop, cursor, gemini/antigravity, codex, opencode, windsurf, all)
 ./target/release/omk install --harness claude-code,cursor
 
-# 3. Verify your Local Vault, background daemon, and harness status
+# 3. Verify your Local Vault, Vault Server (`omk daemon`), and harness status
 ./target/release/omk status
 ./target/release/omk stats
 ./target/release/omk bench --docs 3000 --turns 80
@@ -38,7 +38,7 @@ make build
 For system architecture, protocol schemas, and requirements specifications, refer to the Single Source of Truth (SSOT) documents mapped in [`AGENTS.md`](AGENTS.md):
 
 - [`CONSTITUTION.md`](CONSTITUTION.md): Core design principles and project governance
-- [`docs/architecture.md`](docs/architecture.md): Daemon-Proxy IPC, CQRS pipeline, and storage isolation design
+- [`docs/architecture.md`](docs/architecture.md): Vault Server & Session Proxy IPC, CQRS pipeline, and storage isolation design
 - [`docs/protocol_spec.json`](docs/protocol_spec.json): MCP & JSON-RPC 2.0 tool schemas and error codes
 - [`docs/requirements/index.md`](docs/requirements/index.md): Vision, scope, and feature specifications (`EPIC-*`)
 

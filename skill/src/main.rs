@@ -4,7 +4,7 @@
 //! - `omk install [--vault <dir>] [--harness <spec>] [--target <dir>] [--json]`:
 //!   Automatically detects or targets AI agent harnesses and provisions `SKILL.md` and MCP configs.
 //! - `omk status [--vault <dir>] [--json]`:
-//!   Read-only diagnostics for the Local Vault, SQLite index, background daemon, harnesses, and observability.
+//!   Read-only diagnostics for the Local Vault, SQLite index, Vault Server (`omk daemon`), harnesses, and observability.
 //! - `omk stats [--vault <dir>] [--last <N>] [--slow-ms <ms>] [--reset] [--json]`:
 //!   Privacy-preserving performance and agent efficiency analytics (`REQ-OBS-005`).
 //! - `omk bench [--docs <N>] [--turns <T>] [--json]`:
@@ -12,11 +12,11 @@
 //! - `omk reconcile [--vault <dir>] [--json]`:
 //!   Runs Vault-Index reconciliation (`fsck`) and prints a summary report.
 //! - `omk stop [--vault <dir>] [--json]`:
-//!   Gracefully stops a running `omk daemon` for the Vault.
+//!   Gracefully stops the running Vault Server (`omk daemon`) for the Vault.
 //! - `omk mcp [--vault <dir>]`:
-//!   Runs the Stdio MCP Proxy (`EPIC-IPC-01`).
+//!   Runs the Session Proxy (`EPIC-IPC-01`).
 //! - `omk daemon [--vault <dir>]`:
-//!   Runs the global singleton background daemon (`EPIC-IPC-01`).
+//!   Runs the Vault Server (`omk daemon`, `EPIC-IPC-01`).
 //! - `omk help` / `--help` / `-h` / `--version` / `-V`:
 //!   Displays human-friendly usage documentation or version information.
 
@@ -393,7 +393,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
         // REQ-CLI-001: Invoking bare `omk` in an interactive terminal shows Help instead of hanging
         Subcommand::Help
     } else {
-        // Non-TTY (piped / subprocess) bare `omk` runs the MCP stdio proxy for backwards compatibility
+        // Non-TTY (piped / subprocess) bare `omk` runs the MCP Session Proxy for backwards compatibility
         Subcommand::Mcp { explicit: false }
     };
 
@@ -414,20 +414,20 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
 fn render_help_text(default_vault: &Path) -> String {
     format!(
         r#"omk (oh my knowledge) v{ver}
-Standalone Local Knowledge Vault & MCP Daemon/Proxy for AI Agents
+Standalone Local Knowledge Vault, Vault Server & Session Proxy for AI Agents
 
 USAGE:
   omk <COMMAND> [OPTIONS]
 
 COMMANDS:
   install     Auto-detect AI agent harnesses and provision SKILL.md + MCP config
-  status      Inspect Local Vault, SQLite index, background daemon, and harnesses
+  status      Inspect Local Vault, SQLite index, Vault Server, and harnesses
   stats       Analyze execution latency percentiles, stage bottlenecks, and search quality
   bench       Verify deterministic static invariants (MET-STATIC-01..08) & synthetic workload SLAs
   reconcile   Verify and repair Vault Markdown <-> SQLite FTS5 index consistency
-  stop        Gracefully stop the running background daemon for the Vault
-  mcp         Run the Stdio MCP / JSON-RPC 2.0 proxy (used by AI agent harnesses)
-  daemon      Run the global singleton background daemon directly
+  stop        Gracefully stop the running Vault Server (omk daemon) for the Vault
+  mcp         Run the Session Proxy (Stdio MCP / JSON-RPC 2.0, used by AI agent harnesses)
+  daemon      Run the Vault Server (omk daemon) directly
   help        Display this help message
 
 OPTIONS:
@@ -450,7 +450,7 @@ EXAMPLES:
   omk install                                   # Auto-detect installed harnesses and provision
   omk install --harness claude-code,cursor      # Provision specific harnesses only
   omk install --harness all                     # Provision all 7 supported harnesses
-  omk status                                    # Check Vault, daemon, and harness status
+  omk status                                    # Check Local Vault, Vault Server, and harness status
   omk stats                                     # View P50/P95 latency & stage bottleneck report
   omk bench --docs 3000 --turns 80              # Run 1-year Vault (3000 docs) & 8h day (80 turns) benchmark
   omk reconcile                                 # Rebuild/sync SQLite index from Vault Markdown
@@ -715,7 +715,7 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
             }
         );
         println!();
-        println!("[Background Daemon]");
+        println!("[Vault Server]");
         if daemon_running {
             println!(
                 "  State             : Running (PID: {}, Socket: {})",
@@ -976,7 +976,7 @@ fn format_stats_human(
         report.total_requests, report.succeeded_requests, report.failed_requests
     ));
     out.push_str(&format!(
-        "  Daemon Lifecycle      : {} starts | {} cold starts (auto-spawn) | {} backpressure rejections\n",
+        "  Vault Server Lifecycle: {} starts | {} cold starts (auto-spawn) | {} backpressure rejections\n",
         report.daemon_starts, report.cold_starts, report.backpressure_rejections
     ));
     out.push_str(&format!(
@@ -1213,7 +1213,7 @@ fn format_bench_human(report: &BenchmarkReport) -> String {
     out.push('\n');
     out.push_str("  Lifecycle & Reconciliation Metrics:\n");
     out.push_str(&format!(
-        "    * Daemon Cold Start Ready Time       : {:>8.2} ms (SLA P95 <= 50.0 ms)\n",
+        "    * Vault Server Cold Start Ready Time : {:>8.2} ms (SLA P95 <= 50.0 ms)\n",
         report.cold_start_ready_ms
     ));
     out.push_str(&format!(
@@ -1260,7 +1260,7 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
         Subcommand::Mcp { explicit } => {
             if explicit && is_tty {
                 eprintln!(
-                    "[omk] Starting MCP stdio proxy (waiting for JSON-RPC input on stdin... Press Ctrl+C to exit)"
+                    "[omk] Starting MCP Session Proxy (waiting for JSON-RPC input on stdin... Press Ctrl+C to exit)"
                 );
             }
             let config = ProxyConfig::new(&opts.vault_dir)?;
@@ -1364,12 +1364,12 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
                 }
             } else if stopped {
                 println!(
-                    "omk daemon stopped gracefully (Vault: {}).",
+                    "Vault Server (omk daemon) stopped gracefully (Vault: {}).",
                     paths.vault_dir.display()
                 );
             } else {
                 println!(
-                    "omk daemon is not currently running (Vault: {}).",
+                    "Vault Server (omk daemon) is not currently running (Vault: {}).",
                     paths.vault_dir.display()
                 );
             }

@@ -1,4 +1,4 @@
-//! Global Singleton Background Daemon & Privacy-Preserving Telemetry (`omk daemon`, `EPIC-IPC-01`, `EPIC-OBS-01`).
+//! Vault Server & Privacy-Preserving Telemetry (`omk daemon`, `EPIC-IPC-01`, `EPIC-OBS-01`).
 //!
 //! Guarantees single-instance execution per Vault directory via OS `flock` + PID file,
 //! runs startup Vault-Index reconciliation (`fsck`), listens on a Unix Domain Socket,
@@ -52,7 +52,7 @@ extern "C" {
     fn poll(fds: *mut PollFd, nfds: u32, timeout: c_int) -> c_int;
 }
 
-/// Configuration paths for a Vault workspace and its associated daemon files.
+/// Configuration paths for a Local Vault workspace and its associated Vault Server (`omk daemon`) files.
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
     /// Root directory where `.md` knowledge files and `.omk/` metadata reside.
@@ -63,7 +63,7 @@ pub struct DaemonPaths {
     pub db_path: PathBuf,
     /// Unix Domain Socket path (`<vault_dir>/.omk/daemon.sock` or short `/tmp` fallback if path > 95 bytes).
     pub socket_path: PathBuf,
-    /// Singleton lock & PID file (`<vault_dir>/.omk/daemon.pid`).
+    /// Exclusive process lock & PID file (`<vault_dir>/.omk/daemon.pid`).
     pub pid_path: PathBuf,
     /// Structured JSONL telemetry log file (`<vault_dir>/.omk/daemon.log`).
     pub log_path: PathBuf,
@@ -198,7 +198,7 @@ fn generate_local_salt(vault_dir: &Path) -> u64 {
     }
 }
 
-/// Exclusive OS-level file lock guard (`flock`) ensuring singleton daemon execution.
+/// Exclusive OS-level file lock guard (`flock`) ensuring a single Vault Server (`omk daemon`) instance per Vault.
 pub struct PidLockGuard {
     file: File,
     pid_path: PathBuf,
@@ -208,7 +208,7 @@ impl PidLockGuard {
     /// Attempts to acquire a non-blocking exclusive `flock` on `pid_path` and writes the current PID.
     ///
     /// # Errors
-    /// Returns [`OmkError::InternalError`] if another daemon already holds the lock.
+    /// Returns [`OmkError::InternalError`] if another Vault Server instance already holds the lock.
     pub fn acquire(pid_path: &Path) -> Result<Self, OmkError> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -280,7 +280,7 @@ impl DaemonConfig {
     }
 }
 
-/// Global Singleton Daemon managing the [`KnowledgePipeline`] over a Unix Domain Socket.
+/// Vault Server (`omk daemon`) managing the [`KnowledgePipeline`] over a Unix Domain Socket.
 pub struct DaemonServer {
     config: DaemonConfig,
     dispatcher: Arc<McpDispatcher>,
@@ -356,12 +356,12 @@ impl DaemonServer {
         &self.index_store
     }
 
-    /// Acquires the singleton PID lock, binds the Unix Domain Socket (`MET-STATIC-03` Fast-Bind),
+    /// Acquires the exclusive Vault PID lock, binds the Unix Domain Socket (`MET-STATIC-03` Fast-Bind),
     /// triggers background startup reconciliation (`MET-STATIC-04`, `MET-STATIC-05`), and serves
-    /// incoming proxy connections via an event-driven zero-jitter accept loop (`MET-STATIC-02`).
+    /// incoming Session Proxy connections via an event-driven zero-jitter accept loop (`MET-STATIC-02`).
     ///
     /// # Errors
-    /// Returns [`OmkError::InternalError`] if the singleton lock is already held or socket binding fails.
+    /// Returns [`OmkError::InternalError`] if the Vault PID lock is already held or socket binding fails.
     pub fn run_blocking(&self) -> Result<(), OmkError> {
         let _pid_guard = PidLockGuard::acquire(&self.config.paths.pid_path)?;
 
@@ -1662,7 +1662,7 @@ pub struct BenchmarkReport {
     pub full_reconcile_ms: f64,
     /// Incremental no-op `reconcile` over $N$ unchanged docs duration (`ms`).
     pub incremental_reconcile_ms: f64,
-    /// Daemon Cold Start socket bind + first `ping` ready duration (`ms`).
+    /// Vault Server (`omk daemon`) Cold Start socket bind + first `ping` ready duration (`ms`).
     pub cold_start_ready_ms: f64,
     /// End-to-End `search_knowledge` latency distribution (`ms`).
     pub search_latency: LatencyDistribution,
