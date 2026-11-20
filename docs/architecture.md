@@ -1,6 +1,7 @@
 # omk (oh my knowledge) - Architecture & System Design
 
 [`CONSTITUTION.md`](../CONSTITUTION.md)의 설계 철학을 구현하기 위한 시스템 아키텍처 명세.
+(시각화된 전체 구조 다이어그램은 [`docs/architecture.excalidraw`](architecture.excalidraw) 참조)
 
 ## 1. 기술 스택 (Technology Stack)
 - **Core Language:** Rust (메모리 안전성, GC 없는 고성능, 정적 단일 바이너리 빌드 지원)
