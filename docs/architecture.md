@@ -8,13 +8,13 @@
 - **Communication Data Format:** JSON (MCP 표준 JSON-RPC 2.0 규격 사용)
 - **Testing Framework:** 표준 빌트인 테스트 (`#[cfg(test)]`) 및 Trait 기반 의존성 주입(Dependency Injection) 모킹
 
-## 2. 통신 아키텍처 (Communication Architecture: Daemon & Proxy)
-동시성 제어(Race Condition 방지)와 에이전트 호환성을 모두 충족하기 위해 **글로벌 데몬 + 프록시 패스스루** 패턴을 사용합니다.
-- **`omk daemon` (글로벌 싱글톤 데몬):**
-  - 로컬 백그라운드에서 상주하며 단일 프로세스로서 모든 파일/DB 접근을 통제합니다.
-  - 구동 시 PID 파일 및 OS 레벨 파일 락(`flock`)을 획득하여 다중 프록시가 동시에 기동을 시도하더라도 단일 인스턴스(Singleton)만 실행됨을 보장합니다.
-  - 내부적으로 Unix Domain Socket(또는 로컬 IPC)을 통해 프록시와 통신합니다.
-- **`omk mcp` (Stdio 프록시):**
+## 2. 통신 아키텍처 (Communication Architecture: Vault Server & Session Proxy)
+동시성 제어(Race Condition 방지)와 에이전트 호환성을 모두 충족하기 위해 **Vault Server + Session Proxy** 패턴을 사용합니다.
+- **`omk daemon` (Vault Server / 볼트 서버):**
+  - 로컬 금고(Vault)를 전담 관리하는 백그라운드 서버 프로세스로서 모든 파일/DB 접근을 단일 지점에서 통제합니다.
+  - 구동 시 PID 파일 및 OS 레벨 파일 락(`flock`)을 획득하여 다중 프록시가 동시에 기동을 시도하더라도 Vault당 단일 서버 인스턴스만 실행됨을 보장합니다.
+  - 내부적으로 Unix Domain Socket(또는 로컬 IPC)을 통해 Session Proxy와 통신합니다.
+- **`omk mcp` (Session Proxy / 세션 프록시):**
   - AI 클라이언트(에이전트)가 세션을 열 때마다 띄우는 서브프로세스입니다.
   - 파일이나 DB에 직접 접근하지 않으며, 에이전트의 Stdio 입출력을 `omk daemon`으로 포워딩(Forwarding)합니다.
   - 데몬이 실행 중이지 않을 경우 자동으로 데몬을 백그라운드 기동(Auto-spawn)한 뒤, 명시적 타임아웃(Deadline)과 지수적 백오프(Exponential Backoff) 재시도 전략을 통해 연결합니다.

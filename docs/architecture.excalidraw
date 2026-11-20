@@ -444,13 +444,13 @@
       "updated": 1731565000000,
       "link": null,
       "locked": false,
-      "text": "3. Global Singleton Daemon (omk daemon)",
+      "text": "3. Vault Server (omk daemon)",
       "fontSize": 18,
       "fontFamily": 3,
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "3. Global Singleton Daemon (omk daemon)",
+      "originalText": "3. Vault Server (omk daemon)",
       "lineHeight": 1.35
     },
     {

@@ -33,3 +33,7 @@
 
 ### 3.2 Local Vault (로컬 지식 금고)
 - 마크다운 파일 형태로 사용자의 지식이 저장되는 물리적 로컬 디렉터리 및 검색 인프라를 의미합니다.
+
+### 3.3 Vault Server (`omk daemon`) & Session Proxy (`omk mcp`)
+- **Vault Server (`omk daemon`):** 지정된 Local Vault를 전담하여 모든 마크다운 파일 쓰기와 SQLite FTS5 인덱싱/검색을 단일 프로세스에서 조율하고 처리하는 백그라운드 서버입니다.
+- **Session Proxy (`omk mcp`):** 각 AI 에이전트 세션마다 기동되어 Stdio JSON-RPC 스트림을 Vault Server의 Unix Domain Socket으로 전달하는 경량 프록시입니다.
