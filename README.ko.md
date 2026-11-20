@@ -24,13 +24,14 @@ make build
 # 3. 로컬 금고(Vault), 백그라운드 데몬 및 하네스 연동 상태 진단
 ./target/release/omk status
 ./target/release/omk stats
+./target/release/omk bench --docs 3000 --turns 80
 ```
 
 ### 일상적인 사용 방식 (How It Works)
 
 1. **최초 1회 프로비저닝 (`omk install`):** 로컬에 설치된 주요 AI 에이전트 하네스를 자동으로 감지하고, 기존 MCP 설정을 훼손하지 않으면서(Non-destructive Merge) `omk` 서버와 `SKILL.md` 지침을 등록합니다.
 2. **수동 명령어 호출 불필요 (Zero Manual CLI Calls):** 설치가 끝나면 지식을 저장하거나 찾기 위해 사용자가 직접 CLI 명령어를 입력할 필요가 없습니다. 평소처럼 AI 에이전트와 자연어로 대화하면, 에이전트가 스스로 로컬 금고(`~/.omk/vault`, `OMK_VAULT_DIR` 또는 `--vault <dir>`로 변경 가능)를 검색하고 새로운 의사결정을 축적합니다.
-3. **상태 점검 및 유지보수:** 언제든 `omk status`로 연동 상태를 확인하거나, `omk stats`로 개인정보 노출 없는 구간별 지연 시간(P50/P95) 및 검색 품질 지표를 분석하고, 마크다운 파일을 직접 수정한 뒤 `omk reconcile`로 인덱스를 동기화할 수 있습니다. 전체 CLI 옵션은 `omk --help` 또는 [`EPIC-CLI-01`](docs/requirements/features/EPIC-CLI-01.md), [`EPIC-OBS-01`](docs/requirements/features/EPIC-OBS-01.md) 명세를 참고하십시오.
+3. **상태 점검 및 유지보수:** 언제든 `omk status`로 연동 상태를 확인하거나, `omk stats`로 개인정보 노출 없는 구간별 지연 시간(P50/P95) 및 검색 품질 지표를 분석하고, `omk bench`로 8대 정적 복잡도 불변식(`MET-STATIC-01..08`) 및 가상 워크로드 SLA를 검증하며, 마크다운 파일을 직접 수정한 뒤 `omk reconcile`로 인덱스를 동기화할 수 있습니다. 전체 CLI 옵션은 `omk --help` 또는 [`EPIC-CLI-01`](docs/requirements/features/EPIC-CLI-01.md), [`EPIC-OBS-01`](docs/requirements/features/EPIC-OBS-01.md), [`EPIC-PERF-01`](docs/requirements/features/EPIC-PERF-01.md) 명세를 참고하십시오.
 
 ## 문서 및 지식 맵 (Documentation)
 

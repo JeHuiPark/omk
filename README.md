@@ -24,13 +24,14 @@ make build
 # 3. Verify your Local Vault, background daemon, and harness status
 ./target/release/omk status
 ./target/release/omk stats
+./target/release/omk bench --docs 3000 --turns 80
 ```
 
 ### How It Works in Daily Use
 
 1. **Install Once (`omk install`):** Automatically detects your AI agent harnesses, non-destructively merges the `omk` MCP server into your existing configuration, and installs the `SKILL.md` instructions.
 2. **Zero Manual CLI Calls:** After installation, you never need to run `omk` commands to save or search notes. Simply talk to your AI agent in natural language—your agent will autonomously search prior context and save new decisions into `~/.omk/vault` (override via `OMK_VAULT_DIR` or `--vault <dir>`).
-3. **Inspect & Maintain Anytime:** Run `omk status` to check system health, `omk stats` to analyze privacy-preserving P50/P95 latency and search quality metrics, `omk reconcile` if you edit Markdown files in the Vault directly, or `omk --help` for full CLI options (full CLI specification in [`EPIC-CLI-01`](docs/requirements/features/EPIC-CLI-01.md) and [`EPIC-OBS-01`](docs/requirements/features/EPIC-OBS-01.md)).
+3. **Inspect & Maintain Anytime:** Run `omk status` to check system health, `omk stats` to analyze privacy-preserving P50/P95 latency and search quality metrics, `omk bench` to verify deterministic static invariants (`MET-STATIC-01..08`) and synthetic workload SLAs, `omk reconcile` if you edit Markdown files in the Vault directly, or `omk --help` for full CLI options (full CLI specification in [`EPIC-CLI-01`](docs/requirements/features/EPIC-CLI-01.md), [`EPIC-OBS-01`](docs/requirements/features/EPIC-OBS-01.md), and [`EPIC-PERF-01`](docs/requirements/features/EPIC-PERF-01.md)).
 
 ## Documentation
 
