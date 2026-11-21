@@ -1,0 +1,430 @@
+name: CI — Merge Verification
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs when new commits are pushed to the same PR or branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 1: Governance, Zero-Dependency & SSOT Integrity Check
+  # (CONSTITUTION.md §2–§4, CONTRIBUTING.md)
+  # ---------------------------------------------------------------------------
+  governance:
+    name: "Gate 1 — Governance, Zero-Dep & SSOT Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify zero third-party crate dependencies (CONSTITUTION.md §2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as f:
+              root_toml = tomllib.load(f)
+          with open("core/Cargo.toml", "rb") as f:
+              core_toml = tomllib.load(f)
+          with open("skill/Cargo.toml", "rb") as f:
+              skill_toml = tomllib.load(f)
+
+          errors = []
+
+          # 1. Workspace root must not declare third-party workspace dependencies.
+          ws_deps = root_toml.get("workspace", {}).get("dependencies", {})
+          if ws_deps:
+              errors.append(
+                  f"Cargo.toml [workspace.dependencies] must be empty, found: {list(ws_deps.keys())}"
+              )
+
+          # 2. core/Cargo.toml must have zero external crate dependencies in all sections.
+          for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+              deps = core_toml.get(section, {})
+              if deps:
+                  errors.append(
+                      f"core/Cargo.toml [{section}] must be empty (CONSTITUTION.md §2), found: {list(deps.keys())}"
+                  )
+          for target, cfg in core_toml.get("target", {}).items():
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  deps = cfg.get(section, {})
+                  if deps:
+                      errors.append(
+                          f"core/Cargo.toml [target.{target}.{section}] must be empty, found: {list(deps.keys())}"
+                      )
+
+          # 3. skill/Cargo.toml may only depend on the local path crate omk-core.
+          skill_deps = skill_toml.get("dependencies", {})
+          omk_core_dep = skill_deps.get("omk-core")
+          if (
+              list(skill_deps.keys()) != ["omk-core"]
+              or not isinstance(omk_core_dep, dict)
+              or omk_core_dep.get("path") != "../core"
+              or set(omk_core_dep.keys()) != {"path"}
+          ):
+              errors.append(
+                  f"skill/Cargo.toml [dependencies] must depend only on local omk-core (path = '../core'), found: {skill_deps}"
+              )
+
+          for section in ("dev-dependencies", "build-dependencies"):
+              deps = skill_toml.get(section, {})
+              if deps:
+                  errors.append(
+                      f"skill/Cargo.toml [{section}] must be empty (CONSTITUTION.md §2), found: {list(deps.keys())}"
+                  )
+          for target, cfg in skill_toml.get("target", {}).items():
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  deps = cfg.get(section, {})
+                  if deps:
+                      errors.append(
+                          f"skill/Cargo.toml [target.{target}.{section}] must be empty, found: {list(deps.keys())}"
+                      )
+
+          # 4. Resolved Cargo.lock / metadata graph must contain only omk and omk-core.
+          meta_raw = subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1", "--locked"],
+              text=True,
+          )
+          meta = json.loads(meta_raw)
+          packages = sorted(p["name"] for p in meta.get("packages", []))
+          if packages != ["omk", "omk-core"]:
+              errors.append(
+                  f"Resolved Cargo dependency graph must contain only ['omk', 'omk-core'], found: {packages}"
+              )
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Gate 1.1 passed: zero third-party crate dependencies verified.")
+          PY
+
+      - name: Verify Knowledge Map & SSOT link integrity (CONSTITUTION.md §4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          repo_root = pathlib.Path.cwd().resolve()
+          ssot_docs = [
+              pathlib.Path("AGENTS.md"),
+              pathlib.Path("CONSTITUTION.md"),
+              pathlib.Path("CONTRIBUTING.md"),
+              pathlib.Path("DIRECTORY_LAYOUT.md"),
+              pathlib.Path("docs/requirements/index.md"),
+          ]
+
+          fenced_code_re = re.compile(r"```.*?```", re.DOTALL)
+          inline_code_re = re.compile(r"`[^`\n]+`")
+          md_link_re = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+
+          errors = []
+          resolved_links_by_doc = {}
+          total_links_checked = 0
+
+          for doc in ssot_docs:
+              if not doc.exists():
+                  errors.append(f"Required governance/SSOT document missing: {doc}")
+                  continue
+
+              text = doc.read_text(encoding="utf-8")
+              cleaned = fenced_code_re.sub("", text)
+              cleaned = inline_code_re.sub("", cleaned)
+
+              doc_links = set()
+              for match in md_link_re.finditer(cleaned):
+                  raw_target = match.group(1).strip()
+                  if raw_target.startswith(("http://", "https://", "mailto:", "#")):
+                      continue
+
+                  target_no_frag = raw_target.split("#", 1)[0].split("?", 1)[0]
+                  if not target_no_frag:
+                      continue
+
+                  if target_no_frag.startswith("/"):
+                      resolved = (repo_root / target_no_frag.lstrip("/")).resolve()
+                  else:
+                      resolved = (doc.parent / target_no_frag).resolve()
+
+                  total_links_checked += 1
+                  try:
+                      rel = resolved.relative_to(repo_root)
+                  except ValueError:
+                      errors.append(f"{doc}: link escapes repository root -> {raw_target}")
+                      continue
+
+                  if not resolved.exists():
+                      errors.append(f"{doc}: broken local link -> {raw_target} (resolved: {rel})")
+                  else:
+                      doc_links.add(rel)
+
+              resolved_links_by_doc[doc] = doc_links
+
+          # Verify every docs/requirements/features/EPIC-*.md is registered in docs/requirements/index.md.
+          index_doc = pathlib.Path("docs/requirements/index.md")
+          indexed_targets = resolved_links_by_doc.get(index_doc, set())
+          epic_files = sorted(pathlib.Path("docs/requirements/features").glob("EPIC-*.md"))
+          if not epic_files:
+              errors.append("No EPIC-*.md files found under docs/requirements/features/")
+          for epic in epic_files:
+              if epic not in indexed_targets:
+                  errors.append(
+                      f"{index_doc}: missing registration link for requirement spec {epic}"
+                  )
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}", file=sys.stderr)
+              sys.exit(1)
+
+          print(
+              f"Gate 1.2 passed: {total_links_checked} local links across {len(ssot_docs)} SSOT docs "
+              f"and {len(epic_files)} EPIC specs verified with 0 broken or unregistered entries."
+          )
+          PY
+
+      - name: Verify Branch Name, PR Title & Traceability (Squash-only Policy, CONTRIBUTING.md, CONSTITUTION.md §3)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          head_ref = os.environ.get("HEAD_REF", "").strip()
+          pr_title = os.environ.get("PR_TITLE", "").strip()
+          pr_body = os.environ.get("PR_BODY", "")
+          base_sha = os.environ.get("BASE_SHA", "").strip()
+          head_sha = os.environ.get("HEAD_SHA", "HEAD").strip()
+          rev_range = f"{base_sha}..{head_sha}" if base_sha else f"{head_sha}~1..{head_sha}"
+
+          branch_re = re.compile(
+              r"^(feat|fix|docs|style|refactor|perf|test|chore)/[a-z0-9][a-z0-9._-]*$"
+          )
+          header_re = re.compile(
+              r"^(feat|fix|docs|style|refactor|perf|test|chore)(\([a-z0-9][a-z0-9._/-]*\))?!?: [A-Z].*[^.]$"
+          )
+          trace_re = re.compile(
+              r"(?im)(?:^|\s|[-*`])(?:Refs:\s*[^\n]*(?:\b(?:EPIC|REQ|UC)-[A-Z0-9]+-\d+\b|#\d+\b)|(?:Closes|Fixes|Resolves)\s+#\d+\b)"
+          )
+
+          errors = []
+
+          # 1. Enforce working branch naming convention (CONTRIBUTING.md).
+          if not branch_re.match(head_ref):
+              errors.append(
+                  "Source branch name must follow '<type>/<short-kebab-slug>' matching "
+                  "^(feat|fix|docs|style|refactor|perf|test|chore)/[a-z0-9][a-z0-9._-]*$ "
+                  "(e.g., feat/cli-harness, fix/mcp-discover, docs/epic-obs-01, perf/sqlite-reader-pool): "
+                  f"{head_ref!r}"
+              )
+
+          # 2. Under the Squash-only policy, the PR title becomes the main commit header.
+          if not header_re.match(pr_title):
+              errors.append(
+                  "PR title must follow Conventional Commits header format "
+                  "(<type>[optional scope]: <Capitalized description without trailing period>): "
+                  f"{pr_title!r}"
+              )
+
+          # 3. If the PR modifies core/ or skill/, require a traceability ID in PR body or PR commits.
+          changed_files = subprocess.check_output(
+              ["git", "diff", "--name-only", rev_range],
+              text=True,
+          ).splitlines()
+          touches_code = any(
+              f.startswith("core/") or f.startswith("skill/") for f in changed_files
+          )
+
+          if touches_code:
+              # Strip HTML comments from PR body so template examples do not cause false positives.
+              cleaned_body = re.sub(r"<!--.*?-->", "", pr_body, flags=re.DOTALL)
+              commit_messages = subprocess.check_output(
+                  ["git", "log", "--no-merges", "--format=%B", rev_range],
+                  text=True,
+              )
+              if not (trace_re.search(cleaned_body) or trace_re.search(commit_messages)):
+                  errors.append(
+                      "PR modifies core/ or skill/ without a traceability identifier in the PR description "
+                      "or commits (expected 'Refs: EPIC-... / REQ-...' or 'Closes #...' / 'Refs: #...')."
+                  )
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}", file=sys.stderr)
+              sys.exit(1)
+
+          scope_note = "core/skill traceability verified" if touches_code else "non-code PR"
+          print(f"Gate 1.3 passed: branch '{head_ref}' and PR title validated ({scope_note}).")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Gate 2: Compiler Warnings & Test Suite (docs/coding_conventions.md, CONTRIBUTING.md)
+  # ---------------------------------------------------------------------------
+  test:
+    name: "Gate 2 — Warnings & Test Suite (${{ matrix.os }})"
+    needs: [governance]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure system libsqlite3 development headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev pkg-config
+          pkg-config --modversion sqlite3
+
+      - name: Verify system sqlite3 library (macOS)
+        if: runner.os == 'macOS'
+        run: sqlite3 --version
+
+      # Zero external Rust crates means clean builds finish in seconds without registry cache overhead.
+      - name: Run workspace unit and integration tests with warnings denied
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo test --workspace
+
+  # ---------------------------------------------------------------------------
+  # Gate 3: Deterministic Static Invariants Verification (EPIC-PERF-01)
+  # Note: Packaging & publishing release binaries is handled separately by release.yml.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: "Gate 3 — Static Invariants Verification (${{ matrix.os }})"
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure system libsqlite3 development headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev pkg-config
+          pkg-config --modversion sqlite3
+
+      - name: Verify system sqlite3 library (macOS)
+        if: runner.os == 'macOS'
+        run: sqlite3 --version
+
+      - name: Build optimized binary for static invariant benchmark
+        run: |
+          make build
+          test -x ./target/release/omk
+
+      - name: Verify all 8 deterministic static invariants via omk bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          BENCH_FILE="$(mktemp)"
+          trap 'rm -f "$BENCH_FILE"' EXIT
+          ./target/release/omk bench --docs 500 --turns 20 --json | tee "$BENCH_FILE"
+          python3 - "$BENCH_FILE" <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], "r", encoding="utf-8") as f:
+              data = json.load(f)
+          status = data.get("status")
+          all_passed = data.get("all_invariants_passed")
+          invariants = data.get("static_invariants", [])
+          expected_ids = [f"MET-STATIC-0{i}" for i in range(1, 9)]
+          actual_ids = [item.get("id") for item in invariants]
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as sf:
+                  sf.write(f"### `omk bench` Static Invariants ({os.environ.get('RUNNER_OS', 'unknown')})\n\n")
+                  sf.write(
+                      f"- **Docs:** `{data.get('seeded_docs')}` | "
+                      f"**Turns:** `{data.get('simulated_turns')}` | "
+                      f"**Total RPCs:** `{data.get('total_rpc_calls')}` | "
+                      f"**All Passed:** `{all_passed}`\n\n"
+                  )
+                  sf.write("| ID | Invariant | Observed | Target | Result |\n")
+                  sf.write("| :--- | :--- | :--- | :--- | :---: |\n")
+                  for item in invariants:
+                      mark = "PASS" if item.get("passed") is True else "FAIL"
+                      sf.write(
+                          f"| `{item.get('id')}` | {item.get('name')} | "
+                          f"`{item.get('observed')}` | `{item.get('target')}` | **{mark}** |\n"
+                      )
+                  sf.write("\n")
+
+          errors = []
+          if status != "ok":
+              errors.append(f"Expected benchmark status 'ok', got: {status!r}")
+          if all_passed is not True:
+              errors.append(f"Expected all_invariants_passed=true, got: {all_passed!r}")
+          if actual_ids != expected_ids:
+              errors.append(f"Expected 8 invariants {expected_ids}, got: {actual_ids}")
+
+          for item in invariants:
+              if item.get("passed") is not True:
+                  errors.append(
+                      f"Invariant {item.get('id')} ({item.get('name')}) failed: "
+                      f"observed={item.get('observed')}, target={item.get('target')}"
+                  )
+
+          if errors:
+              for err in errors:
+                  print(f"::error::{err}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Gate 3 passed: all 8 deterministic static invariants verified.")
+          PY

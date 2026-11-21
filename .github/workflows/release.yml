@@ -1,0 +1,156 @@
+name: Release — Build & Publish Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 0: Verify the pushed v* tag points to a commit merged into origin/main
+  # ---------------------------------------------------------------------------
+  verify-main-commit:
+    name: "Verify Tag Targets Merged main Commit"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert tagged commit is reachable from origin/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_SHA="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+
+          echo "Verifying tag '${TAG_NAME}' (${TAG_SHA}) against origin/main (${MAIN_SHA})..."
+          if ! git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main; then
+            echo "::error::Release blocked: Tag '${TAG_NAME}' (${TAG_SHA}) does NOT reference a commit merged into 'main' (${MAIN_SHA}). Release tags must only be created on commits already merged into 'main'." >&2
+            exit 1
+          fi
+          echo "Verified: '${TAG_NAME}' (${TAG_SHA}) is a valid merged commit on origin/main."
+
+  build:
+    name: "Build & Package (${{ matrix.target }})"
+    needs: [verify-main-commit]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            native: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            native: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            native: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            native: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure system libsqlite3 development headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev pkg-config
+          pkg-config --modversion sqlite3
+
+      - name: Verify system sqlite3 library (macOS)
+        if: runner.os == 'macOS'
+        run: sqlite3 --version
+
+      - name: Build standalone release binary
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          test -x "target/${{ matrix.target }}/release/omk"
+          ls -lh "target/${{ matrix.target }}/release/omk"
+
+      - name: Smoke-test native release binary
+        if: matrix.native
+        run: |
+          "target/${{ matrix.target }}/release/omk" --version
+
+      - name: Package tar.gz archive and SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="omk-${VERSION}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" omk
+
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            else
+              shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            fi
+            cat "${ARCHIVE}.sha256"
+          )
+
+      - name: Upload packaged release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omk-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: "Publish GitHub Release"
+    needs: [verify-main-commit, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate combined SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          cat *.sha256 | sort > SHA256SUMS.txt
+          ls -lh
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${GITHUB_REF_NAME}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release-assets/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release-assets/* \
+              --title "omk ${RELEASE_TAG}" \
+              --generate-notes
+          fi
