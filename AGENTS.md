@@ -9,12 +9,13 @@
 - **DRY Documentation:** 지침이나 문서를 작성할 때 다른 파일에 존재하는 규칙이나 맥락을 복사하거나 요약해 풀어쓰지 마라. 반드시 해당 파일의 링크나 경로만을 참조(Reference)하여 단일 진실 공급원(SSOT)을 지켜라.
 - **Document SRP (문서 단일 책임 원칙):** 각 문서는 하나의 명확한 책임만 갖는다. 새로운 정보를 추가할 때는 내용의 성격을 파악하고 이에 부합하는 단 하나의 문서에만 기록하여 문서가 비대해지는 것을 막아라.
 - **Pre-flight Check:** 새로운 규칙이나 문서 구조를 추가하기 전, 반드시 기존 지식 맵(Knowledge Map)의 파일들을 먼저 읽거나 검색하여 이미 동일한 성격의 룰이 존재하는지 파악하라.
+- **Branch & PR Governance:** AI 에이전트(서브 에이전트 및 워커 포함)는 `main` 브랜치에 직접 커밋·푸시하지 말고, 반드시 [`CONTRIBUTING.md`](CONTRIBUTING.md)에 정의된 작업 브랜치 네이밍 규칙과 PR(Squash Merge) 절차를 따르라.
 
 ## 2. Knowledge Map (지식 맵)
 AI가 제품 개발을 성공적으로 진행하기 위해, 작업 전후로 아래 지식 맵을 참고하여 프로젝트 컨텍스트를 파악해야 한다.
 지식 맵의 내용 및 구조 갱신에 대한 상세 조건은 [`CONSTITUTION.md`](CONSTITUTION.md)의 **"4. Documentation & Knowledge Management"** 원칙을 엄격히 따른다.
 - **[`CONSTITUTION.md`](CONSTITUTION.md):** 프로젝트 거버넌스, 기본 설계 철학 및 요구사항 관리 체계 (프로젝트 헌법)
-- **[`CONTRIBUTING.md`](CONTRIBUTING.md):** 오픈소스 기여 가이드 및 커밋 메시지 규칙
+- **[`CONTRIBUTING.md`](CONTRIBUTING.md):** 오픈소스 기여 가이드, 작업 브랜치·커밋 규칙 및 PR(Squash Merge) 워크플로우
 - **[`docs/coding_conventions.md`](docs/coding_conventions.md):** 코딩 컨벤션, 문서화 규칙 및 테스트 전략
 - **[`docs/requirements/index.md`](docs/requirements/index.md):** 제품 요구사항 및 스펙 진입점(Entry Point)
 - **[`docs/requirements/glossary.md`](docs/requirements/glossary.md):** 프로젝트 핵심 구성요소(omk CLI, omk Skill, AI Agent 등) 및 도메인 경계의 고유 명칭과 역할 정의 (용어 사전)

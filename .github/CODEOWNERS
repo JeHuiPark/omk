@@ -1,0 +1,26 @@
+# Repository Governance & Code Ownership (CONSTITUTION.md §2–§4)
+# Changes to governance policies, third-party dependencies, SSOT specs,
+# CI pipelines, and repository code require review and approval from the
+# technical lead.
+
+# Default owner for the entire repository
+* @JeHuiPark
+
+# Core governance and collaboration rules
+/CONSTITUTION.md @JeHuiPark
+/AGENTS.md @JeHuiPark
+/CONTRIBUTING.md @JeHuiPark
+/DIRECTORY_LAYOUT.md @JeHuiPark
+
+# Dependency manifests and lockfile (Zero Heavy Dependencies gate)
+/Cargo.toml @JeHuiPark
+/Cargo.lock @JeHuiPark
+/core/Cargo.toml @JeHuiPark
+/skill/Cargo.toml @JeHuiPark
+
+# Architecture and requirements SSOT
+/docs/architecture.md @JeHuiPark
+/docs/requirements/ @JeHuiPark
+
+# GitHub workflows, templates, and repository governance configuration
+/.github/ @JeHuiPark
