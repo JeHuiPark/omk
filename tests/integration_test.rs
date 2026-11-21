@@ -914,7 +914,7 @@ fn test_mcp_server_discover_and_standard_discovery_probes() {
             .get("serverInfo")
             .and_then(|s| s.get("version"))
             .and_then(JsonValue::as_str),
-        Some("0.1.0")
+        Some(env!("CARGO_PKG_VERSION"))
     );
     assert!(
         result

@@ -938,13 +938,27 @@ fn parse_search_query(args: &JsonValue) -> Result<SearchQuery, OmkError> {
     })
 }
 
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn build_initialize_result() -> JsonValue {
-    let raw = r#"{
-        "protocolVersion": "2024-11-05",
-        "capabilities": { "tools": {} },
-        "serverInfo": { "name": "omk", "version": "0.1.0" }
-    }"#;
-    JsonValue::parse(raw).unwrap_or(JsonValue::Null)
+    let mut server_info = BTreeMap::new();
+    server_info.insert("name".to_string(), JsonValue::Str("omk".to_string()));
+    server_info.insert(
+        "version".to_string(),
+        JsonValue::Str(SERVER_VERSION.to_string()),
+    );
+
+    let mut capabilities = BTreeMap::new();
+    capabilities.insert("tools".to_string(), JsonValue::Object(BTreeMap::new()));
+
+    let mut root = BTreeMap::new();
+    root.insert(
+        "protocolVersion".to_string(),
+        JsonValue::Str("2024-11-05".to_string()),
+    );
+    root.insert("capabilities".to_string(), JsonValue::Object(capabilities));
+    root.insert("serverInfo".to_string(), JsonValue::Object(server_info));
+    JsonValue::Object(root)
 }
 
 fn build_discover_result() -> JsonValue {

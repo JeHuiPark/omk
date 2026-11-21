@@ -1,0 +1,147 @@
+name: Release PR — Plan & Prepare Version Bump
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_as:
+        description: "Explicit target SemVer (e.g., 1.0.0) to override automatic version calculation"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pr-main
+  cancel-in-progress: false
+
+jobs:
+  prepare-release-pr:
+    name: "Plan & Open/Update Release PR"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Check token mode
+        env:
+          HAS_BOT_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN != '' }}
+        run: |
+          if [ "${HAS_BOT_TOKEN}" != "true" ]; then
+            echo "::notice::RELEASE_BOT_TOKEN is not configured; falling back to GITHUB_TOKEN. Note that PRs opened with GITHUB_TOKEN will not automatically trigger pull_request CI checks due to GitHub anti-recursion rules."
+          else
+            echo "Using RELEASE_BOT_TOKEN so created/updated release PRs automatically trigger CI pull_request checks."
+          fi
+
+      - name: Skip when HEAD is already a merged release commit
+        id: head_check
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_gov.py detect-release-commit \
+            --commit HEAD \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Compute next SemVer release plan
+        id: plan
+        if: github.event_name == 'workflow_dispatch' || steps.head_check.outputs.is_release != 'true'
+        shell: bash
+        env:
+          RELEASE_AS: ${{ inputs.release_as }}
+        run: |
+          set -euo pipefail
+          PLAN_ARGS=(plan --head-ref HEAD --json --github-output "$GITHUB_OUTPUT")
+          if [ -n "${RELEASE_AS}" ]; then
+            PLAN_ARGS+=(--release-as "${RELEASE_AS}")
+          fi
+          python3 .github/scripts/release_gov.py "${PLAN_ARGS[@]}"
+
+      - name: Apply version bump, push branch, and create/update/promote release PR
+        if: steps.plan.outputs.should_release == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN || github.token }}
+          NEXT_VERSION: ${{ steps.plan.outputs.next_version }}
+          NEXT_TAG: ${{ steps.plan.outputs.next_tag }}
+          CURRENT_VERSION: ${{ steps.plan.outputs.current_version }}
+          BUMP_TYPE: ${{ steps.plan.outputs.bump_type }}
+          RELEASE_BRANCH: ${{ steps.plan.outputs.release_branch }}
+          PR_TITLE: ${{ steps.plan.outputs.pr_title }}
+        run: |
+          set -euo pipefail
+
+          # Always branch from latest main so strict_required_status_checks_policy passes immediately.
+          git checkout -B "${RELEASE_BRANCH}" HEAD
+
+          python3 .github/scripts/release_gov.py bump --version "${NEXT_VERSION}"
+          python3 .github/scripts/release_gov.py check-ssot
+
+          git add Cargo.toml Cargo.lock docs/protocol_spec.json CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No file changes produced by bump; skipping branch push and PR creation."
+            exit 0
+          fi
+
+          git commit -m "${PR_TITLE}"
+          git push --force origin "HEAD:refs/heads/${RELEASE_BRANCH}"
+
+          NOTES_FILE="$(mktemp)"
+          BODY_FILE="$(mktemp)"
+          trap 'rm -f "${NOTES_FILE}" "${BODY_FILE}"' EXIT
+
+          python3 .github/scripts/release_gov.py extract-notes \
+            --tag "${NEXT_TAG}" \
+            --output "${NOTES_FILE}"
+
+          {
+            printf '## Release Summary\n\n'
+            printf 'Automated release preparation for **`%s`** (`%s` -> `%s`, bump: `%s`).\n\n' \
+              "${NEXT_TAG}" "${CURRENT_VERSION}" "${NEXT_VERSION}" "${BUMP_TYPE}"
+            printf '### Synchronized Version SSOT Files\n'
+            printf -- '- `Cargo.toml` (`[workspace.package].version`)\n'
+            printf -- '- `Cargo.lock` (`omk`, `omk-core`)\n'
+            printf -- '- `docs/protocol_spec.json` (3 version fields)\n'
+            printf -- '- `CHANGELOG.md`\n\n'
+            printf '### Release Notes Preview\n\n'
+            cat "${NOTES_FILE}"
+            printf '\n---\n\n'
+            printf '**Merge action:** Squash and merge this PR into `main` once all CI gates pass. '
+            printf 'Merging automatically triggers `.github/workflows/release.yml` to verify the 5-way Version Integrity Gate, '
+            printf 'create annotated tag `%s`, build cross-platform release binaries, and publish the GitHub Release.\n' \
+              "${NEXT_TAG}"
+          } > "${BODY_FILE}"
+
+          EXISTING_PR="$(gh pr list --state open --base main --head "${RELEASE_BRANCH}" --json number --jq '.[0].number // empty')"
+          if [ -n "${EXISTING_PR}" ]; then
+            gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body-file "${BODY_FILE}"
+            ACTIVE_PR="${EXISTING_PR}"
+            echo "Updated existing release PR #${ACTIVE_PR} (${RELEASE_BRANCH})."
+          else
+            PR_URL="$(gh pr create --base main --head "${RELEASE_BRANCH}" --title "${PR_TITLE}" --body-file "${BODY_FILE}")"
+            ACTIVE_PR="$(gh pr list --state open --base main --head "${RELEASE_BRANCH}" --json number --jq '.[0].number')"
+            echo "Created release PR #${ACTIVE_PR} (${PR_URL})."
+          fi
+
+          # Close any superseded open release PRs (e.g., version promoted from v0.1.1 -> v0.2.0).
+          SUPERSEDED_PRS="$(gh pr list --state open --base main --json number,headRefName \
+            --jq ".[] | select((.headRefName | startswith(\"chore/release-v\")) and .headRefName != \"${RELEASE_BRANCH}\") | .number")"
+          for OLD_PR in ${SUPERSEDED_PRS}; do
+            echo "Closing superseded release PR #${OLD_PR} in favor of #${ACTIVE_PR} (${NEXT_TAG})..."
+            gh pr close "${OLD_PR}" \
+              --comment "Superseded by release PR #${ACTIVE_PR} (\`${NEXT_TAG}\`)." \
+              --delete-branch
+          done

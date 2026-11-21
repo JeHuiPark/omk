@@ -1,9 +1,9 @@
 [package]
 name = "omk"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Standalone local knowledge vault skill with MCP Vault Server and Session Proxy for AI agents"
-license = "MIT"
 
 [lib]
 name = "omk"

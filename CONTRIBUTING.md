@@ -49,11 +49,20 @@ Each commit message consists of a **header**, a **body**, and a **footer**.
    - Set the **PR title** to a valid Conventional Commits header (`<type>[optional scope]: <Capitalized description>` without a trailing period).
    - Include traceability references (`Refs: EPIC-... / REQ-...` or `Closes #...`) in the PR description or commits whenever changing `core/` or `skill/`.
 4. Pass all 3 CI Merge Gates in [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
-   - **Gate 1:** Zero third-party dependencies, Knowledge Map & SSOT link integrity, branch naming, PR title, and traceability.
+   - **Gate 1:** Zero third-party dependencies, Knowledge Map & SSOT link integrity, branch naming, PR title, traceability, and Version SSOT + release governance script tests (Gate 1.4).
    - **Gate 2:** Zero compiler warnings and full workspace tests (`RUSTFLAGS="-D warnings" cargo test --workspace`).
    - **Gate 3:** Deterministic static invariants verification (`omk bench --docs 500 --turns 20 --json`).
 5. **Squash and merge only:** Merge into `main` exclusively via **Squash and merge** so `main` stays linear with one clean commit per PR, using the Conventional Commits PR title as the commit header and preserving traceability footers in the commit body.
-6. **Release Tagging (`v*`):** Release tags (e.g., `v0.1.0`) must only be created on commits already merged into `main`. [`.github/workflows/release.yml`](.github/workflows/release.yml) verifies `git merge-base --is-ancestor <tag_sha> origin/main` before building or publishing binaries.
+
+### 3. Version SSOT & Automated Release PR Governance
+- **Version Single Source of Truth (SSOT):** The workspace version is declared once in [`Cargo.toml`](Cargo.toml) (`[workspace.package].version`) and inherited by [`core/Cargo.toml`](core/Cargo.toml) and [`skill/Cargo.toml`](skill/Cargo.toml) via `version.workspace = true`. All Rust binaries, protocol metadata, and tests read `env!("CARGO_PKG_VERSION")` instead of hardcoding version literals.
+- **SemVer Rules (`0.y.z` protection):**
+  - `feat:` bumps **Minor**; `fix:` and `perf:` bump **Patch**; `refactor:` does not trigger a version bump on its own but is recorded in [`CHANGELOG.md`](CHANGELOG.md) on release; `docs:`, `style:`, `test:`, and `chore:` do not trigger releases.
+  - While on `0.y.z`, `BREAKING CHANGE:` / `!:` bumps **Minor** (preventing unintended automatic `1.0.0` promotion). Promote to `1.0.0` explicitly via `workflow_dispatch` with the `release_as` input.
+- **Automated Release PR & Publish Flow:**
+  1. Merging releasable commits into `main` runs [`.github/workflows/release-pr.yml`](.github/workflows/release-pr.yml) (using [`.github/scripts/release_gov.py`](.github/scripts/release_gov.py)), which synchronizes `Cargo.toml`, `Cargo.lock`, [`docs/protocol_spec.json`](docs/protocol_spec.json), and [`CHANGELOG.md`](CHANGELOG.md), and opens/updates (or promotes) a release PR (`chore/release-vX.Y.Z` titled `chore(release): Prepare vX.Y.Z`).
+  2. Squash-merging the release PR triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which verifies `origin/main` ancestry (Gate 0.1) and the 5-way Version Integrity Gate (Gate 0.2: Git tag, `Cargo.toml`, `Cargo.lock`, `docs/protocol_spec.json`, and runtime `omk --version`), creates annotated tag `vX.Y.Z`, builds cross-platform binaries, and publishes the GitHub Release from [`CHANGELOG.md`](CHANGELOG.md).
+  3. Manual `v*` tags are also supported as a secondary trigger, subject to the same `origin/main` ancestry and 5-way Version Integrity Gate checks.
 
 ## Coding Conventions & Testing
 Please refer to the [Coding Conventions & Testing Strategy](docs/coding_conventions.md) document for rules regarding Rust documentation, error handling, and testing strategies. All code must adhere to these guidelines.
