@@ -5,6 +5,29 @@
   "version": "0.1.0",
   "description": "omk (oh my knowledge) MCP & JSON-RPC 2.0 Protocol Specification",
   "lifecycle": {
+    "server/discover": {
+      "description": "Discovers server metadata, capabilities, and exposed tool schemas for modern MCP clients.",
+      "params": {
+        "protocolVersion": "string (optional)",
+        "capabilities": "object (optional)",
+        "clientInfo": "object (optional)"
+      },
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+          "tools": {}
+        },
+        "serverInfo": {
+          "name": "omk",
+          "version": "0.1.0"
+        },
+        "tools": [
+          "upsert_knowledge",
+          "search_knowledge",
+          "read_knowledge"
+        ]
+      }
+    },
     "initialize": {
       "description": "Initializes the MCP session and returns server capabilities.",
       "params": {
@@ -37,6 +60,27 @@
           "search_knowledge",
           "read_knowledge"
         ]
+      }
+    },
+    "resources/list": {
+      "description": "Returns an empty resource list for standard MCP discovery compatibility.",
+      "params": {},
+      "result": {
+        "resources": []
+      }
+    },
+    "resources/templates/list": {
+      "description": "Returns an empty resource template list for standard MCP discovery compatibility.",
+      "params": {},
+      "result": {
+        "resourceTemplates": []
+      }
+    },
+    "prompts/list": {
+      "description": "Returns an empty prompt list for standard MCP discovery compatibility.",
+      "params": {},
+      "result": {
+        "prompts": []
       }
     },
     "tools/call": {

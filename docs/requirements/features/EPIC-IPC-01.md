@@ -6,7 +6,7 @@
 
 ### 1.2 Scope
 - Vault Server(`omk daemon`)와 Session Proxy(`omk mcp`)의 역할, 프로세스 락, 기동 및 복구 생명주기.
-- MCP Server 통신 규격(`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`) 및 레거시/직접 JSON-RPC 메서드 호환.
+- MCP Server 통신 규격(`server/discover`, `initialize`, `notifications/initialized`, `ping`, `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`, `tools/call`) 및 직접 JSON-RPC 메서드 호환.
 - 타임아웃, 백프레셔, 표준화된 에러 코드 체계.
 
 ## 2. Overall Description
@@ -29,7 +29,9 @@
 ### 3.2 REQ-IPC-002: MCP 프로토콜 및 Tools 노출 (CQRS 통합)
 - **3.2.1 Description and Priority:** 높은 우선순위.
 - **3.2.2 Functional Requirements:**
-  - MCP 표준 핸드셰이크(`initialize`, `notifications/initialized`, `ping`)를 지원해야 한다.
+  - MCP 표준 연결 초기화(`initialize`, `notifications/initialized`, `ping`)와 최신 MCP 규격 클라이언트의 세션 기능 탐색(discovery) 요청(`server/discover`)을 모두 지원해야 한다.
+    - `server/discover` 요청 수신 시 `-32601 (MethodNotFound)` 에러로 기존 초기화 절차로 전환되지 않도록, `protocolVersion`, `serverInfo`(`name`, `version`), `capabilities`(`tools: {}`) 및 제공 도구(`tools`) JSON Schema 목록을 포함한 유효한 기능 탐색 응답을 즉시 반환해야 한다.
+  - 표준 MCP 기능 탐색 호환을 위해 클라이언트가 `resources/list`, `resources/templates/list`, `prompts/list`를 조회할 경우에도 에러 대신 각각 빈 배열 응답(`{"resources":[]}`, `{"resourceTemplates":[]}`, `{"prompts":[]}`)을 안전하게 반환해야 한다.
   - `tools/list` 요청에 대해 다음 3가지 핵심 도구의 JSON Schema를 반환해야 한다:
     1. `upsert_knowledge`: 지식 생성 및 동기화 전략 기반 갱신 (Command Pipeline)
     2. `search_knowledge`: FTS5 전문 검색 및 메타데이터 필터링 (Query Pipeline)

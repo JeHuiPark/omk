@@ -176,11 +176,13 @@ sequenceDiagram
   - *Response 3:* 기존 로그/텔레메트리 데이터를 초기화하고 결과를 안내함.
 - **3.5.3 Functional Requirements:**
   - CLI 파서(`skill/src/main.rs`)는 신규 서브커맨드 `stats`와 관련 옵션(`--last <N>`, `--slow-ms <ms>`, `--reset`, `--json`, `--vault <dir>`)을 지원해야 하며, `omk help` 출력에 `stats` 명령어 설명을 포함해야 한다.
-  - `omk stats`는 데몬을 강제 기동하지 않고 `<vault_dir>/.omk/daemon.log`(및 로테이션된 로그 파일)를 Read-only로 파싱하여 다음 **5대 진단 섹션**을 산출해야 한다:
+  - `omk stats`는 데몬을 강제 기동하지 않고 `<vault_dir>/.omk/daemon.log`(및 로테이션된 실행 기록 로그 파일)를 읽기 전용으로 파싱하여 다음 **5대 진단 섹션**을 산출해야 한다. 특히 세션 초기화·제어 RPC(`server/discover`, `initialize`, `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`, `ping` 등 `tool_name`이 없는 요청)가 실제 지식 도구 실행 통계를 왜곡하지 않도록 두 트래픽을 명확히 구분해 집계해야 한다:
     1. **Overview & Lifecycle Summary (실행 및 생명주기 요약):**
-       - 분석된 총 RPC 요청 수, 성공/실패 건수 및 에러 코드별 분포, 데몬 기동 횟수, **Cold Start (`auto_spawn`) 발생 횟수**, 기동 시 `reconcile` 평균/최대 소요 시간(`ms`).
+       - **지식 도구 호출(Knowledge Tool Calls)**(`tool_name`이 존재하는 요청 및 `tools/call`)과 **세션 제어 RPC(Session Control RPCs)**의 요청 수 및 성공/실패 건수를 명확히 분리하여 표시하고, 하위 호환을 위해 전체 RPC 요청 합계와 에러 코드별 분포(도구/제어 구분 포함)를 함께 제공한다.
+       - 데몬 기동 횟수, **Cold Start (`auto_spawn`) 발생 횟수**, 백프레셔 거절 횟수, 기동 시 `reconcile` 평균/최대 소요 시간(`ms`)을 표시한다.
     2. **Tool Latency Breakdown (도구별 지연 시간 백분위수):**
-       - `search_knowledge`, `upsert_knowledge`, `read_knowledge`, `reconcile` 및 전체 요청에 대한 호출 횟수(`Count`), 평균(`Avg`), `P50`(중앙값), `P95`, `P99`, `Max` 지연 시간(`ms`).
+       - `search_knowledge`, `upsert_knowledge`, `read_knowledge`, `reconcile` 및 전체 도구 합산(`all`)에 대한 호출 횟수(`Count`), 평균(`Avg`), `P50`(중앙값), `P95`, `P99`, `Max` 지연 시간(`ms`)을 산출한다.
+       - `all` 행은 실제 지식 도구 호출 기준으로 집계하여 세션 제어 RPC에 의한 지연 시간 희석을 방지한다(조회 구간 내 지식 도구 호출이 0건인 경우에만 전체 RPC 기준으로 산출한다). 세션 제어 RPC 지연 시간은 별도 `control_rpc` 항목으로 분리 표시한다.
     3. **Stage Bottleneck Attribution (세부 구간별 병목 비중):**
        - 각 도구의 평균 지연 시간 중 세부 Span이 차지하는 시간(`ms`)과 비중(`%`)을 분해하여 표시해야 한다:
          - `upsert_knowledge`: `lock_wait` vs `validate_read` vs `vault_write` (`fsync` 포함) vs `index_write`
@@ -189,10 +191,12 @@ sequenceDiagram
     4. **Agent Efficiency & Search Quality (에이전트 활용 및 검색 품질 지표):**
        - 총 검색 횟수 대비 **Zero-Hit Rate (`0`건 결과 비율, %)** 및 평균 반환 매칭 건수.
        - 동일 `query_ref` 해시가 단시간 내에 반복 호출된 **중복/재시도 검색 횟수(Repeated Query Churn)**.
-       - 요청/응답 페이로드 바이트 및 추정 토큰 수(`Avg` / `P95` / `Max` tokens).
+       - 요청/응답 페이로드 바이트 및 추정 토큰 수(`Avg` / `P95` / `Max` tokens)는 실제 지식 도구 호출 기준으로 집계하여 제어 RPC에 의한 평균 왜곡을 방지한다(지식 도구 호출이 0건인 경우에만 전체 RPC 기준으로 산출한다).
     5. **Slow Request Anomalies (느린 요청 요약 - Top N):**
-       - 임계치(기본값 `50ms`, `--slow-ms`로 조정 가능)를 초과한 느린 요청 중 상위 `N`건(기본 5건)에 대해 발생 시각, 도구명, 총 소요 시간(`ms`), 가장 큰 비중을 차지한 병목 구간(`dominant_span`, 예: `vault_fsync: 82%`), 익명 참조 해시(`doc_ref` / `query_ref`)를 원문 노출 없이 출력해야 한다.
-  - `omk status` (`EPIC-CLI-01` `REQ-CLI-003`) 실행 시에도 관측 로그가 존재할 경우 `[Observability Summary]` 항목(누적 요청 수, 최근 에러 수, 상세 분석을 위한 `omk stats` 안내)을 간략히 표시하여 진단 접근성을 높여야 한다.
+       - 임계치(기본값 `50ms`, `--slow-ms`로 조정 가능)를 초과한 느린 요청 중 상위 `N`건(기본 5건)에 대해 발생 시각, 도구/메서드명, 총 소요 시간(`ms`), 가장 큰 비중을 차지한 병목 구간(`dominant_span`, 예: `vault_fsync: 82%`), 익명 참조 해시(`doc_ref` / `query_ref`)를 원문 노출 없이 출력해야 한다.
+  - **`--last <N>` 조회 구간 기준:** 세션 연결마다 발생하는 제어 RPC가 `--last <N>` 조회 범위를 점유해 실제 지식 도구 실행 통계를 가리지 않도록, 실행 기록 로그에 지식 도구 호출이 존재하는 경우 최근 `N`건의 지식 도구 호출이 포함되는 구간을 기준으로 집계한다(지식 도구 호출이 0건인 경우에만 최근 `N`건의 전체 RPC를 대상으로 집계한다).
+  - **`--json` 하위 호환성:** 기존 JSON 출력 필드(`total_requests`, `succeeded_requests`, `failed_requests`, `error_counts` 등)를 그대로 유지하면서, 지식 도구 호출 및 세션 제어 RPC 분리 필드(`tool_requests`, `tool_succeeded_requests`, `tool_failed_requests`, `tool_error_counts`, `control_requests`, `control_succeeded_requests`, `control_failed_requests`, `control_error_counts`, `latency_ms.control_rpc`, `metrics_scope`)를 함께 제공한다.
+  - `omk status` (`EPIC-CLI-01` `REQ-CLI-003`) 실행 시에도 실행 기록 로그가 존재할 경우 `[Observability Summary]` 항목에서 지식 도구 호출과 세션 제어 RPC 건수를 구분해 표시하고(전체 누적 요청 수, 에러 수, `omk stats` 안내 포함) 실제 도구 오류 여부를 즉시 파악할 수 있도록 한다.
 
 ---
 
