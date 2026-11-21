@@ -1,8 +1,9 @@
 //! MCP & JSON-RPC 2.0 Protocol Router and Message Formatting (`EPIC-IPC-01`).
 //!
-//! Supports both standard Model Context Protocol (`initialize`, `notifications/initialized`,
-//! `ping`, `tools/list`, `tools/call`) and direct JSON-RPC tool invocations
-//! (`upsert_knowledge`, `search_knowledge`, `read_knowledge`, `reconcile`).
+//! Supports both standard Model Context Protocol (`server/discover`, `initialize`,
+//! `notifications/initialized`, `ping`, `tools/list`, `resources/list`,
+//! `resources/templates/list`, `prompts/list`, `tools/call`) and direct JSON-RPC
+//! tool invocations (`upsert_knowledge`, `search_knowledge`, `read_knowledge`, `reconcile`).
 
 use omk_core::domain::{
     estimate_tokens, JsonValue, KnowledgeEntity, OmkError, ReadMetrics, ReadTimings,
@@ -51,7 +52,7 @@ pub struct ProxySpanContext {
 /// Tool-specific microsecond-level Span timings (`REQ-OBS-001`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolTimings {
-    /// Non-pipeline RPC method (`initialize`, `ping`, `tools/list`).
+    /// Non-pipeline control/lifecycle RPC method (`server/discover`, `initialize`, `ping`, `tools/list`, etc.).
     None,
     /// `upsert_knowledge` spans.
     Upsert(UpsertTimings),
@@ -480,6 +481,14 @@ impl McpDispatcher {
         OmkError,
     > {
         match req.method.as_str() {
+            "server/discover" => Ok((
+                build_discover_result(),
+                ToolTimings::None,
+                ToolMetrics::None,
+                0,
+                None,
+                None,
+            )),
             "initialize" => Ok((
                 build_initialize_result(),
                 ToolTimings::None,
@@ -498,6 +507,30 @@ impl McpDispatcher {
             )),
             "tools/list" => Ok((
                 build_tools_list_result(),
+                ToolTimings::None,
+                ToolMetrics::None,
+                0,
+                None,
+                None,
+            )),
+            "resources/list" => Ok((
+                build_empty_list_result("resources"),
+                ToolTimings::None,
+                ToolMetrics::None,
+                0,
+                None,
+                None,
+            )),
+            "resources/templates/list" => Ok((
+                build_empty_list_result("resourceTemplates"),
+                ToolTimings::None,
+                ToolMetrics::None,
+                0,
+                None,
+                None,
+            )),
+            "prompts/list" => Ok((
+                build_empty_list_result("prompts"),
                 ToolTimings::None,
                 ToolMetrics::None,
                 0,
@@ -912,6 +945,25 @@ fn build_initialize_result() -> JsonValue {
         "serverInfo": { "name": "omk", "version": "0.1.0" }
     }"#;
     JsonValue::parse(raw).unwrap_or(JsonValue::Null)
+}
+
+fn build_discover_result() -> JsonValue {
+    let mut map = match build_initialize_result() {
+        JsonValue::Object(m) => m,
+        _ => BTreeMap::new(),
+    };
+    let tools = build_tools_list_result()
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+    map.insert("tools".to_string(), tools);
+    JsonValue::Object(map)
+}
+
+fn build_empty_list_result(key: &str) -> JsonValue {
+    let mut map = BTreeMap::new();
+    map.insert(key.to_string(), JsonValue::Array(Vec::new()));
+    JsonValue::Object(map)
 }
 
 fn build_tools_list_result() -> JsonValue {

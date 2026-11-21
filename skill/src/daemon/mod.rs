@@ -1114,14 +1114,32 @@ pub struct SlowRequestAnomaly {
 /// Complete aggregated observability report for `omk stats` and `omk status` (`REQ-OBS-005`).
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryStatsReport {
-    /// Total RPC requests analyzed.
+    /// Total RPC requests analyzed (knowledge tool calls + session control RPCs).
     pub total_requests: usize,
     /// Successful RPC requests (`status == "ok"`).
     pub succeeded_requests: usize,
     /// Failed RPC requests (`status == "error"`).
     pub failed_requests: usize,
-    /// Error code distribution (`code -> count`).
+    /// Error code distribution across all analyzed RPCs (`code -> count`).
     pub error_counts: BTreeMap<i32, usize>,
+    /// Actual knowledge tool call requests (`tool_name` present or `tools/call`).
+    pub tool_requests: usize,
+    /// Successful knowledge tool call requests.
+    pub tool_succeeded_requests: usize,
+    /// Failed knowledge tool call requests.
+    pub tool_failed_requests: usize,
+    /// Error code distribution for knowledge tool calls only (`code -> count`).
+    pub tool_error_counts: BTreeMap<i32, usize>,
+    /// Session control / lifecycle RPC requests (`server/discover`, `initialize`, `tools/list`, `ping`, etc.).
+    pub control_requests: usize,
+    /// Successful session control / lifecycle RPC requests.
+    pub control_succeeded_requests: usize,
+    /// Failed session control / lifecycle RPC requests.
+    pub control_failed_requests: usize,
+    /// Error code distribution for session control / lifecycle RPCs only (`code -> count`).
+    pub control_error_counts: BTreeMap<i32, usize>,
+    /// Scope used for `all` latency and payload/token averages (`"tool_calls"` or `"all_rpc"`).
+    pub metrics_scope: String,
     /// Number of `daemon_started` lifecycle events.
     pub daemon_starts: usize,
     /// Number of Cold Start (`cold_start == true`) events.
@@ -1134,7 +1152,7 @@ pub struct TelemetryStatsReport {
     pub startup_reconcile_avg_ms: f64,
     /// Maximum startup reconciliation latency (`ms`).
     pub startup_reconcile_max_ms: f64,
-    /// Latency percentile breakdown per tool (`"all"`, `"upsert_knowledge"`, `"search_knowledge"`, `"read_knowledge"`, `"reconcile"`).
+    /// Latency percentile breakdown per tool (`"all"`, `"upsert_knowledge"`, `"search_knowledge"`, `"read_knowledge"`, `"reconcile"`, `"control_rpc"`).
     pub latency_by_tool: BTreeMap<String, LatencyDistribution>,
     /// Stage bottleneck attribution per tool.
     pub stage_attribution: BTreeMap<String, Vec<StageShare>>,
@@ -1177,6 +1195,23 @@ pub fn reset_telemetry_logs(paths: &DaemonPaths) -> usize {
         }
     }
     removed
+}
+
+/// Returns `true` if a logged `rpc_completed` record represents an actual knowledge tool invocation
+/// rather than a session control / lifecycle RPC (`REQ-OBS-005`).
+fn is_tool_rpc_event(ev: &JsonValue) -> bool {
+    let has_tool_name = ev
+        .get("tool_name")
+        .and_then(JsonValue::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_tool_name {
+        return true;
+    }
+    matches!(
+        ev.get("rpc_method").and_then(JsonValue::as_str),
+        Some("tools/call")
+    )
 }
 
 /// Parses `daemon.log` (and rotated backups) in chronological order and computes the
@@ -1257,9 +1292,38 @@ pub fn compute_telemetry_stats(
             .fold(0.0_f64, f64::max);
     }
 
+    let tool_indices: Vec<usize> = rpc_events
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ev)| is_tool_rpc_event(ev).then_some(idx))
+        .collect();
+
+    // When knowledge tool calls exist, anchor `--last N` on the last N tool calls so that
+    // session control/handshake RPCs never crowd out real tool execution metrics (`REQ-OBS-005`).
     let selected_rpc: &[JsonValue] = match last_n {
-        Some(n) if n < rpc_events.len() => &rpc_events[rpc_events.len() - n..],
-        _ => &rpc_events[..],
+        Some(0) => &[],
+        Some(n) => {
+            if !tool_indices.is_empty() {
+                if n < tool_indices.len() {
+                    let start_idx = tool_indices[tool_indices.len() - n];
+                    &rpc_events[start_idx..]
+                } else {
+                    &rpc_events[..]
+                }
+            } else if n < rpc_events.len() {
+                &rpc_events[rpc_events.len() - n..]
+            } else {
+                &rpc_events[..]
+            }
+        }
+        None => &rpc_events[..],
+    };
+
+    let has_tool_calls = selected_rpc.iter().any(is_tool_rpc_event);
+    report.metrics_scope = if has_tool_calls {
+        "tool_calls".to_string()
+    } else {
+        "all_rpc".to_string()
     };
 
     let mut tool_samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -1269,6 +1333,7 @@ pub fn compute_telemetry_stats(
         "search_knowledge",
         "read_knowledge",
         "reconcile",
+        "control_rpc",
     ] {
         tool_samples.insert(key.to_string(), Vec::new());
     }
@@ -1284,18 +1349,47 @@ pub fn compute_telemetry_stats(
     let mut seen_queries = BTreeMap::<String, usize>::new();
     let mut req_bytes_sum = 0usize;
     let mut resp_bytes_sum = 0usize;
+    let mut payload_sample_count = 0usize;
     let mut token_samples = Vec::new();
     let mut anomalies = Vec::new();
 
     for ev in selected_rpc {
+        let is_tool = is_tool_rpc_event(ev);
         report.total_requests += 1;
         let status = ev.get("status").and_then(JsonValue::as_str).unwrap_or("ok");
+        let err_code_opt = ev
+            .get("error_code")
+            .and_then(JsonValue::as_f64)
+            .map(|c| c as i32);
+
         if status == "ok" {
             report.succeeded_requests += 1;
         } else {
             report.failed_requests += 1;
-            if let Some(code) = ev.get("error_code").and_then(JsonValue::as_f64) {
-                *report.error_counts.entry(code as i32).or_insert(0) += 1;
+            if let Some(code) = err_code_opt {
+                *report.error_counts.entry(code).or_insert(0) += 1;
+            }
+        }
+
+        if is_tool {
+            report.tool_requests += 1;
+            if status == "ok" {
+                report.tool_succeeded_requests += 1;
+            } else {
+                report.tool_failed_requests += 1;
+                if let Some(code) = err_code_opt {
+                    *report.tool_error_counts.entry(code).or_insert(0) += 1;
+                }
+            }
+        } else {
+            report.control_requests += 1;
+            if status == "ok" {
+                report.control_succeeded_requests += 1;
+            } else {
+                report.control_failed_requests += 1;
+                if let Some(code) = err_code_opt {
+                    *report.control_error_counts.entry(code).or_insert(0) += 1;
+                }
             }
         }
 
@@ -1321,32 +1415,46 @@ pub fn compute_telemetry_stats(
             .unwrap_or(daemon_us);
         let effective_ms = proxy_us.max(daemon_us) / 1000.0;
 
-        if let Some(vec) = tool_samples.get_mut("all") {
-            vec.push(effective_ms);
-        }
-        if let Some(vec) = tool_samples.get_mut(tool_name) {
-            vec.push(effective_ms);
+        if is_tool {
+            if let Some(vec) = tool_samples.get_mut("all") {
+                vec.push(effective_ms);
+            }
+            if let Some(vec) = tool_samples.get_mut(tool_name) {
+                vec.push(effective_ms);
+            }
+        } else {
+            if let Some(vec) = tool_samples.get_mut("control_rpc") {
+                vec.push(effective_ms);
+            }
+            if !has_tool_calls {
+                if let Some(vec) = tool_samples.get_mut("all") {
+                    vec.push(effective_ms);
+                }
+            }
         }
 
         if let Some(m) = metrics {
             if m.get("cold_start").and_then(JsonValue::as_bool) == Some(true) {
                 report.cold_starts += 1;
             }
-            let req_b = m
-                .get("req_bytes")
-                .and_then(JsonValue::as_f64)
-                .unwrap_or(0.0) as usize;
-            let resp_b = m
-                .get("resp_bytes")
-                .and_then(JsonValue::as_f64)
-                .unwrap_or(0.0) as usize;
-            let est_tok = m
-                .get("estimated_tokens")
-                .and_then(JsonValue::as_f64)
-                .unwrap_or(0.0) as usize;
-            req_bytes_sum += req_b;
-            resp_bytes_sum += resp_b;
-            token_samples.push(est_tok);
+            if is_tool || !has_tool_calls {
+                let req_b = m
+                    .get("req_bytes")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0) as usize;
+                let resp_b = m
+                    .get("resp_bytes")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0) as usize;
+                let est_tok = m
+                    .get("estimated_tokens")
+                    .and_then(JsonValue::as_f64)
+                    .unwrap_or(0.0) as usize;
+                req_bytes_sum += req_b;
+                resp_bytes_sum += resp_b;
+                payload_sample_count += 1;
+                token_samples.push(est_tok);
+            }
 
             if tool_name == "search_knowledge" && status == "ok" {
                 report.total_searches += 1;
@@ -1504,9 +1612,9 @@ pub fn compute_telemetry_stats(
         report.avg_search_results = total_search_hits as f64 / report.total_searches as f64;
     }
 
-    if report.total_requests > 0 {
-        report.req_bytes_avg = req_bytes_sum as f64 / report.total_requests as f64;
-        report.resp_bytes_avg = resp_bytes_sum as f64 / report.total_requests as f64;
+    if payload_sample_count > 0 {
+        report.req_bytes_avg = req_bytes_sum as f64 / payload_sample_count as f64;
+        report.resp_bytes_avg = resp_bytes_sum as f64 / payload_sample_count as f64;
     }
 
     if !token_samples.is_empty() {

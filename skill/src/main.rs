@@ -678,6 +678,30 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
             JsonValue::Number(obs_stats.failed_requests as f64),
         );
         obs_obj.insert(
+            "tool_requests".to_string(),
+            JsonValue::Number(obs_stats.tool_requests as f64),
+        );
+        obs_obj.insert(
+            "tool_succeeded_requests".to_string(),
+            JsonValue::Number(obs_stats.tool_succeeded_requests as f64),
+        );
+        obs_obj.insert(
+            "tool_failed_requests".to_string(),
+            JsonValue::Number(obs_stats.tool_failed_requests as f64),
+        );
+        obs_obj.insert(
+            "control_requests".to_string(),
+            JsonValue::Number(obs_stats.control_requests as f64),
+        );
+        obs_obj.insert(
+            "control_succeeded_requests".to_string(),
+            JsonValue::Number(obs_stats.control_succeeded_requests as f64),
+        );
+        obs_obj.insert(
+            "control_failed_requests".to_string(),
+            JsonValue::Number(obs_stats.control_failed_requests as f64),
+        );
+        obs_obj.insert(
             "cold_starts".to_string(),
             JsonValue::Number(obs_stats.cold_starts as f64),
         );
@@ -731,6 +755,18 @@ fn run_status_command(vault_dir: &Path, json_output: bool) -> Result<(), OmkErro
         }
         println!();
         println!("[Observability Summary]");
+        println!(
+            "  Tool Calls        : {} total ({} ok, {} errors)",
+            obs_stats.tool_requests,
+            obs_stats.tool_succeeded_requests,
+            obs_stats.tool_failed_requests
+        );
+        println!(
+            "  Control RPCs      : {} total ({} ok, {} errors)",
+            obs_stats.control_requests,
+            obs_stats.control_succeeded_requests,
+            obs_stats.control_failed_requests
+        );
         println!(
             "  Logged Requests   : {} total ({} ok, {} errors, {} cold starts)",
             obs_stats.total_requests,
@@ -802,6 +838,14 @@ fn format_stats_json(report: &TelemetryStatsReport) -> String {
     for (code, cnt) in &report.error_counts {
         err_map.insert(code.to_string(), JsonValue::Number(*cnt as f64));
     }
+    let mut tool_err_map = BTreeMap::new();
+    for (code, cnt) in &report.tool_error_counts {
+        tool_err_map.insert(code.to_string(), JsonValue::Number(*cnt as f64));
+    }
+    let mut control_err_map = BTreeMap::new();
+    for (code, cnt) in &report.control_error_counts {
+        control_err_map.insert(code.to_string(), JsonValue::Number(*cnt as f64));
+    }
 
     let mut overview = BTreeMap::new();
     overview.insert(
@@ -817,6 +861,42 @@ fn format_stats_json(report: &TelemetryStatsReport) -> String {
         JsonValue::Number(report.failed_requests as f64),
     );
     overview.insert("error_counts".to_string(), JsonValue::Object(err_map));
+    overview.insert(
+        "tool_requests".to_string(),
+        JsonValue::Number(report.tool_requests as f64),
+    );
+    overview.insert(
+        "tool_succeeded_requests".to_string(),
+        JsonValue::Number(report.tool_succeeded_requests as f64),
+    );
+    overview.insert(
+        "tool_failed_requests".to_string(),
+        JsonValue::Number(report.tool_failed_requests as f64),
+    );
+    overview.insert(
+        "tool_error_counts".to_string(),
+        JsonValue::Object(tool_err_map),
+    );
+    overview.insert(
+        "control_requests".to_string(),
+        JsonValue::Number(report.control_requests as f64),
+    );
+    overview.insert(
+        "control_succeeded_requests".to_string(),
+        JsonValue::Number(report.control_succeeded_requests as f64),
+    );
+    overview.insert(
+        "control_failed_requests".to_string(),
+        JsonValue::Number(report.control_failed_requests as f64),
+    );
+    overview.insert(
+        "control_error_counts".to_string(),
+        JsonValue::Object(control_err_map),
+    );
+    overview.insert(
+        "metrics_scope".to_string(),
+        JsonValue::Str(report.metrics_scope.clone()),
+    );
     overview.insert(
         "daemon_starts".to_string(),
         JsonValue::Number(report.daemon_starts as f64),
@@ -972,6 +1052,14 @@ fn format_stats_human(
     // Section 1: Overview & Lifecycle Summary
     out.push_str("[1. Overview & Lifecycle Summary]\n");
     out.push_str(&format!(
+        "  Knowledge Tool Calls  : {} ({} succeeded, {} failed)\n",
+        report.tool_requests, report.tool_succeeded_requests, report.tool_failed_requests
+    ));
+    out.push_str(&format!(
+        "  Session Control RPCs  : {} ({} succeeded, {} failed)\n",
+        report.control_requests, report.control_succeeded_requests, report.control_failed_requests
+    ));
+    out.push_str(&format!(
         "  Total RPC Requests    : {} ({} succeeded, {} failed)\n",
         report.total_requests, report.succeeded_requests, report.failed_requests
     ));
@@ -990,6 +1078,25 @@ fn format_stats_human(
             .map(|(code, cnt)| format!("{}: {}", code, cnt))
             .collect();
         out.push_str(&format!("  Error Code Breakdown  : {}\n", errs.join(", ")));
+        if !report.tool_error_counts.is_empty() {
+            let tool_errs: Vec<String> = report
+                .tool_error_counts
+                .iter()
+                .map(|(code, cnt)| format!("{}: {}", code, cnt))
+                .collect();
+            out.push_str(&format!("    - Tool Calls        : {}\n", tool_errs.join(", ")));
+        }
+        if !report.control_error_counts.is_empty() {
+            let ctrl_errs: Vec<String> = report
+                .control_error_counts
+                .iter()
+                .map(|(code, cnt)| format!("{}: {}", code, cnt))
+                .collect();
+            out.push_str(&format!(
+                "    - Session Control   : {}\n",
+                ctrl_errs.join(", ")
+            ));
+        }
     }
     out.push('\n');
 
@@ -1010,6 +1117,22 @@ fn format_stats_human(
             key, d.count, d.avg_ms, d.p50_ms, d.p95_ms, d.p99_ms, d.max_ms
         ));
     }
+    out.push_str("  -------------------------------------------------------------------------------\n");
+    let ctrl_d = report
+        .latency_by_tool
+        .get("control_rpc")
+        .cloned()
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "  {:<18} {:>5} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}\n",
+        "control_rpc",
+        ctrl_d.count,
+        ctrl_d.avg_ms,
+        ctrl_d.p50_ms,
+        ctrl_d.p95_ms,
+        ctrl_d.p99_ms,
+        ctrl_d.max_ms
+    ));
     out.push('\n');
 
     // Section 3: Stage Bottleneck Attribution
@@ -1036,12 +1159,13 @@ fn format_stats_human(
         report.avg_search_results, report.repeated_query_churn
     ));
     out.push_str(&format!(
-        "  Payload & Tokens      : Req Avg {:.0} B | Resp Avg {:.0} B | Tokens Avg {:.1} / P95 {} / Max {}\n\n",
+        "  Payload & Tokens      : Req Avg {:.0} B | Resp Avg {:.0} B | Tokens Avg {:.1} / P95 {} / Max {} (scope: {})\n\n",
         report.req_bytes_avg,
         report.resp_bytes_avg,
         report.tokens_avg,
         report.tokens_p95,
-        report.tokens_max
+        report.tokens_max,
+        report.metrics_scope
     ));
 
     // Section 5: Slow Request Anomalies
