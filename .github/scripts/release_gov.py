@@ -462,7 +462,7 @@ def format_commit_bullet(entry: CommitEntry) -> str:
     if entry.breaking and entry.breaking_note and entry.breaking_note != entry.description:
         text = f"{text} ({entry.breaking_note})"
     if short_sha:
-        return f"- {text} (`{short_sha}`)"
+        return f"- {text} ({short_sha})"
     return f"- {text}"
 
 
