@@ -296,6 +296,13 @@ jobs:
           print(f"Gate 1.3 passed: branch '{head_ref}' and PR title validated ({scope_note}).")
           PY
 
+      - name: "Gate 1.4 — Verify Version SSOT & Run Governance Script Tests"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s .github/scripts -p "test_release_gov.py" -v
+          python3 .github/scripts/release_gov.py check-ssot
+
   # ---------------------------------------------------------------------------
   # Gate 2: Compiler Warnings & Test Suite (docs/coding_conventions.md, CONTRIBUTING.md)
   # ---------------------------------------------------------------------------

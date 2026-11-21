@@ -2,6 +2,8 @@ name: Release — Build & Publish Binaries
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -14,36 +16,134 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gate 0: Verify the pushed v* tag points to a commit merged into origin/main
+  # Gate 0: Release Trigger Detection, main Ancestry Check (Gate 0.1),
+  # 5-Way Version Integrity Pre-Check (Gate 0.2), and Annotated Tagging
   # ---------------------------------------------------------------------------
-  verify-main-commit:
-    name: "Verify Tag Targets Merged main Commit"
+  prepare-and-verify:
+    name: "Gate 0 — Verify main Ancestry, Version Integrity & Tag"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      release_tag: ${{ steps.detect.outputs.release_tag }}
+      release_version: ${{ steps.detect.outputs.release_version }}
+      release_sha: ${{ steps.detect.outputs.release_sha }}
     steps:
+      # Intentionally uses default github.token so creating & pushing the annotated
+      # tag does NOT spawn a duplicate `push: tags: ["v*"]` run while this run chains
+      # directly into `build` and `publish`.
       - name: Checkout repository with full history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Assert tagged commit is reachable from origin/main
+      - name: Determine release trigger and target tag
+        id: detect
         shell: bash
         run: |
           set -euo pipefail
+          COMMIT_SHA="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            VERSION="${TAG_NAME#v}"
+            echo "Tag trigger detected: ${TAG_NAME} (${COMMIT_SHA})"
+            {
+              echo "should_release=true"
+              echo "create_tag=false"
+              echo "release_tag=${TAG_NAME}"
+              echo "release_version=${VERSION}"
+              echo "release_sha=${COMMIT_SHA}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Branch push on main: only release when HEAD is a Squash-merged release PR commit.
+          DETECT_JSON="$(python3 .github/scripts/release_gov.py detect-release-commit --commit "${COMMIT_SHA}" --json)"
+          echo "${DETECT_JSON}"
+
+          IS_RELEASE="$(python3 -c 'import json, sys; print("true" if json.loads(sys.argv[1])["is_release"] else "false")' "${DETECT_JSON}")"
+          if [ "${IS_RELEASE}" != "true" ]; then
+            echo "HEAD on main is not a release commit; skipping release pipeline."
+            {
+              echo "should_release=false"
+              echo "create_tag=false"
+              echo "release_tag="
+              echo "release_version="
+              echo "release_sha=${COMMIT_SHA}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG_NAME="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["tag"])' "${DETECT_JSON}")"
+          VERSION="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["version"])' "${DETECT_JSON}")"
+          echo "Merged release PR detected on main: ${TAG_NAME} (${COMMIT_SHA})"
+          {
+            echo "should_release=true"
+            echo "create_tag=true"
+            echo "release_tag=${TAG_NAME}"
+            echo "release_version=${VERSION}"
+            echo "release_sha=${COMMIT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Gate 0.1 — Assert release commit is reachable from origin/main"
+        if: steps.detect.outputs.should_release == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.detect.outputs.release_tag }}
+          TARGET_SHA: ${{ steps.detect.outputs.release_sha }}
+        run: |
+          set -euo pipefail
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          TAG_NAME="${GITHUB_REF_NAME}"
-          TAG_SHA="$(git rev-parse "${GITHUB_SHA}^{commit}")"
           MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
 
-          echo "Verifying tag '${TAG_NAME}' (${TAG_SHA}) against origin/main (${MAIN_SHA})..."
-          if ! git merge-base --is-ancestor "${TAG_SHA}" refs/remotes/origin/main; then
-            echo "::error::Release blocked: Tag '${TAG_NAME}' (${TAG_SHA}) does NOT reference a commit merged into 'main' (${MAIN_SHA}). Release tags must only be created on commits already merged into 'main'." >&2
+          echo "Verifying '${TAG_NAME}' (${TARGET_SHA}) against origin/main (${MAIN_SHA})..."
+          if ! git merge-base --is-ancestor "${TARGET_SHA}" refs/remotes/origin/main; then
+            echo "::error::Release blocked: '${TAG_NAME}' (${TARGET_SHA}) does NOT reference a commit merged into 'main' (${MAIN_SHA}). Release tags must only be created on commits already merged into 'main'." >&2
             exit 1
           fi
-          echo "Verified: '${TAG_NAME}' (${TAG_SHA}) is a valid merged commit on origin/main."
+          echo "Gate 0.1 passed: '${TAG_NAME}' (${TARGET_SHA}) is a valid merged commit on origin/main."
+
+      - name: "Gate 0.2 — Verify Version Integrity Gate (Tag, Cargo.toml, Cargo.lock, protocol_spec.json)"
+        if: steps.detect.outputs.should_release == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.detect.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_gov.py verify-release --tag "${TAG_NAME}"
+
+      - name: Create and push annotated release tag
+        if: steps.detect.outputs.should_release == 'true' && steps.detect.outputs.create_tag == 'true'
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.detect.outputs.release_tag }}
+          TARGET_SHA: ${{ steps.detect.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --tags origin
+          if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            EXISTING_SHA="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+            if [ "${EXISTING_SHA}" = "${TARGET_SHA}" ]; then
+              echo "Annotated tag '${TAG_NAME}' already points to ${TARGET_SHA}; continuing."
+              exit 0
+            fi
+            echo "::error::Tag '${TAG_NAME}' already exists on commit ${EXISTING_SHA}, expected ${TARGET_SHA}." >&2
+            exit 1
+          fi
+
+          git tag -a "${TAG_NAME}" -m "Release ${TAG_NAME}" "${TARGET_SHA}"
+          git push origin "refs/tags/${TAG_NAME}"
+          echo "Created and pushed annotated tag '${TAG_NAME}' at ${TARGET_SHA}."
 
   build:
     name: "Build & Package (${{ matrix.target }})"
-    needs: [verify-main-commit]
+    needs: [prepare-and-verify]
+    if: needs.prepare-and-verify.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -62,8 +162,10 @@ jobs:
             native: false
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout repository
+      - name: Checkout verified release commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-and-verify.outputs.release_sha }}
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,17 +189,24 @@ jobs:
           test -x "target/${{ matrix.target }}/release/omk"
           ls -lh "target/${{ matrix.target }}/release/omk"
 
-      - name: Smoke-test native release binary
+      - name: "Verify 5-way Version Integrity Gate on native binary (--version == omk X.Y.Z)"
         if: matrix.native
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare-and-verify.outputs.release_tag }}
         run: |
-          "target/${{ matrix.target }}/release/omk" --version
+          set -euo pipefail
+          python3 .github/scripts/release_gov.py verify-release \
+            --tag "${RELEASE_TAG}" \
+            --binary "target/${{ matrix.target }}/release/omk"
 
       - name: Package tar.gz archive and SHA-256 checksum
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare-and-verify.outputs.release_tag }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          ARCHIVE="omk-${VERSION}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="omk-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
           tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" omk
 
@@ -120,11 +229,17 @@ jobs:
 
   publish:
     name: "Publish GitHub Release"
-    needs: [verify-main-commit, build]
+    needs: [prepare-and-verify, build]
+    if: needs.prepare-and-verify.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout verified release commit for CHANGELOG.md
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-and-verify.outputs.release_sha }}
+
       - name: Download all packaged artifacts
         uses: actions/download-artifact@v4
         with:
@@ -140,17 +255,39 @@ jobs:
           ls -lh
           cat SHA256SUMS.txt
 
-      - name: Create or update GitHub Release
+      - name: Extract release notes from CHANGELOG.md and publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-and-verify.outputs.release_tag }}
         run: |
           set -euo pipefail
-          RELEASE_TAG="${GITHUB_REF_NAME}"
+          NOTES_FILE="$(mktemp)"
+          trap 'rm -f "${NOTES_FILE}"' EXIT
+
+          HAS_NOTES="false"
+          if python3 .github/scripts/release_gov.py extract-notes \
+            --tag "${RELEASE_TAG}" \
+            --output "${NOTES_FILE}"; then
+            HAS_NOTES="true"
+            cat "${NOTES_FILE}"
+          else
+            echo "::warning::No CHANGELOG.md entry found for ${RELEASE_TAG}; falling back to GitHub auto-generated release notes."
+          fi
+
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" release-assets/* --clobber
+            if [ "${HAS_NOTES}" = "true" ]; then
+              gh release edit "${RELEASE_TAG}" --notes-file "${NOTES_FILE}"
+            fi
           else
-            gh release create "${RELEASE_TAG}" release-assets/* \
-              --title "omk ${RELEASE_TAG}" \
-              --generate-notes
+            if [ "${HAS_NOTES}" = "true" ]; then
+              gh release create "${RELEASE_TAG}" release-assets/* \
+                --title "omk ${RELEASE_TAG}" \
+                --notes-file "${NOTES_FILE}"
+            else
+              gh release create "${RELEASE_TAG}" release-assets/* \
+                --title "omk ${RELEASE_TAG}" \
+                --generate-notes
+            fi
           fi
