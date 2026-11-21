@@ -207,6 +207,8 @@ class SemVerCalculationTests(unittest.TestCase):
         self.assertIn("Refactoring", with_fix.sections)
         self.assertIn("Bug Fixes", with_fix.sections)
         self.assertIn("### Refactoring", with_fix.changelog_section)
+        self.assertIn("(ddddddd)", with_fix.changelog_section)
+        self.assertNotIn("(`ddddddd`)", with_fix.changelog_section)
         self.assertNotIn("Update architecture guide", with_fix.changelog_section)
 
     def test_zero_x_breaking_change_bumps_minor_not_major(self) -> None:

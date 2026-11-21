@@ -11,20 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
-- **obs:** Implement end-to-end span telemetry, Zero-PII redaction, log rotation, and omk stats (`cfa1b85`)
-- **skill:** Implement human-friendly CLI UX, status command, and multi-harness provisioning (`784ea87`)
-- **skill:** Auto-provision global MCP config and agent instructions on omk install (`36750a3`)
-- **skill:** Implement MCP protocol router, singleton daemon, Stdio proxy, and skill installer (`fad1984`)
-- **core:** Implement domain models, Vault DocumentStore, SQLite FTS5 IndexStore, and CQRS pipeline (`f717648`)
+- **obs:** Implement end-to-end span telemetry, Zero-PII redaction, log rotation, and omk stats (cfa1b85)
+- **skill:** Implement human-friendly CLI UX, status command, and multi-harness provisioning (784ea87)
+- **skill:** Auto-provision global MCP config and agent instructions on omk install (36750a3)
+- **skill:** Implement MCP protocol router, singleton daemon, Stdio proxy, and skill installer (fad1984)
+- **core:** Implement domain models, Vault DocumentStore, SQLite FTS5 IndexStore, and CQRS pipeline (f717648)
 
 ### Bug Fixes
 
-- **skill:** Support MCP server/discover and separate tool vs control RPC stats (`2a94cfc`)
+- **skill:** Support MCP server/discover and separate tool vs control RPC stats (2a94cfc)
 
 ### Performance
 
-- Implement persistent IPC, Fast-Bind, incremental reconcile, SQLite reader pool, and omk bench (`27c41c1`)
+- Implement persistent IPC, Fast-Bind, incremental reconcile, SQLite reader pool, and omk bench (27c41c1)
 
 ### Refactoring
 
-- Unify Vault Server and Session Proxy terminology across docs, CLI, and tests (`26faf75`)
+- Unify Vault Server and Session Proxy terminology across docs, CLI, and tests (26faf75)
