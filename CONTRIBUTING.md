@@ -53,6 +53,7 @@ Each commit message consists of a **header**, a **body**, and a **footer**.
    - **Gate 2:** Zero compiler warnings and full workspace tests (`RUSTFLAGS="-D warnings" cargo test --workspace`).
    - **Gate 3:** Deterministic static invariants verification (`omk bench --docs 500 --turns 20 --json`).
 5. **Squash and merge only:** Merge into `main` exclusively via **Squash and merge** so `main` stays linear with one clean commit per PR, using the Conventional Commits PR title as the commit header and preserving traceability footers in the commit body.
+6. **Human Maintainer Merge Only:** Merging into `main` (`gh pr merge`), creating or modifying GitHub Releases (`gh release *`), and changing repository settings or rulesets are reserved exclusively for the human maintainer (see [`CONSTITUTION.md`](CONSTITUTION.md) §2 and [`AGENTS.md`](AGENTS.md) §1). Even after opening a PR on explicit request, AI agents must never self-merge or mutate remote release/repository state and must wait for the human maintainer to review and squash-merge.
 
 ### 3. Version SSOT & Automated Release PR Governance
 - **Version Single Source of Truth (SSOT):** The workspace version is declared once in [`Cargo.toml`](Cargo.toml) (`[workspace.package].version`) and inherited by [`core/Cargo.toml`](core/Cargo.toml) and [`skill/Cargo.toml`](skill/Cargo.toml) via `version.workspace = true`. All Rust binaries, protocol metadata, and tests read `env!("CARGO_PKG_VERSION")` instead of hardcoding version literals.
