@@ -62,3 +62,13 @@ AI 지식 금고의 특성상 쓰기(저장/인덱싱)와 읽기(검색/조회)�
 ### 5.3 이종 스토리지 정합성 및 자가 복구 (Reconciliation / Auto-Recovery)
 - **트랜잭션 조율:** `DocumentStore`(SSOT)에 원자적 쓰기를 선행한 후 `IndexStore`를 갱신합니다.
 - **구동 시 자가 복구(`reconcile`):** 데몬 기동 시(또는 복구 명령 실행 시) Vault 내 마크다운 파일의 버전 해시(`version_hash`)와 인덱스 DB 상태를 대사(Reconciliation)하여, 누락되거나 불일치하는 인덱스를 자동으로 재구축합니다.
+
+## 6. 품질 속성별 일련의 의도 (Chain of Intentionality)
+[`CONSTITUTION.md`](../CONSTITUTION.md) §1의 **Intentionality & Quality Attributes** 원칙에 따라, `omk` 시스템에서 최상위 목표 품질 속성이 어떤 아키텍처 의도를 거쳐 구체적인 하위 세부 제약으로 관통하는지 아래와 같이 매핑합니다. 아래 **강제되는 핵심 세부 제약**은 시스템 품질 속성에 직결되는 아키텍처 영역이므로 [`CONSTITUTION.md`](../CONSTITUTION.md) §2의 사전 승인 없이 임의로 우회하거나 완화할 수 없으며, 이 사슬에 속하지 않는 일반 세부 사항만 합리적인 구현 자율성에 열어둡니다.
+
+| 목표 품질 속성 (Quality Attribute) | 최상위 아키텍처 의도 (High-level Intent) | 강제되는 핵심 세부 제약 (Low-level Constraint / Invariant) | 근거 및 검증 기준 |
+| :--- | :--- | :--- | :--- |
+| **데이터 무결성·신뢰성**<br>(Integrity & Reliability) | 비정상 종료나 동시 쓰기 상황에서도 원본 지식 문서(SSOT) 손상·유실과 인덱스 불일치를 방지 | - 마크다운 저장 시 `.tmp` 임시 파일 기록 → `fsync` → 원자적 이름 변경(`rename`) 강제 (§5.1)<br>- `DocumentStore`(SSOT) 선행 기록 후 `IndexStore` 갱신 및 기동 시 `version_hash` 기반 자가 복구(`reconcile`) (§5.3)<br>- 권위 정책(`USER_EXPLICIT` 보호) 사전 검증 (§4.2) | §4.2, §5.1, §5.3<br>[`EPIC-VAULT-01`](requirements/features/EPIC-VAULT-01.md)<br>[`EPIC-DATA-01`](requirements/features/EPIC-DATA-01.md) |
+| **동시성·저지연 성능**<br>(Concurrency & Low-Latency) | 다중 에이전트 동시 접근 시 경쟁 상태(Race Condition)를 차단하고, 장기 축적된 금고에서도 일관된 저지연 응답을 보장 | - PID·OS 파일 락(`flock`) 기반 단일 Vault Server 인스턴스 및 단일 직렬화 쓰기 큐(Single-writer) (§2, §4.1)<br>- Session Proxy 영속 UDS 연결 재사용, 무지터 블로킹 `accept`, Fast-Bind 기동 및 증분·배치 `reconcile`<br>- SQLite WAL 모드, Reader 커넥션 풀 재사용, SQL `WHERE` 필터 푸시다운 및 2단계 `OR` 자동 전환 검색<br>- 큐 임계치 초과 시 즉시 거절(`-32001 Server Busy`) 백프레셔 (§4.1) | §2, §4.1<br>[`EPIC-PERF-01`](requirements/features/EPIC-PERF-01.md)<br>(`MET-STATIC-01`~`08`, `omk bench`) |
+| **보안·프라이버시**<br>(Security & Privacy) | 로컬 지식 금고 외부로의 파일 접근과 실행 기록 로그를 통한 개인정보·지식 원문 유출을 원천 차단 | - 문서 ID·경로 정규화(Canonicalization/Sanitization)로 Vault 루트 외부 경로 탐색(Path Traversal) 차단 (§5.1)<br>- 실행 기록 로그의 원문 기록 금지(Zero-PII), 홈·Vault 경로 치환, 로컬 솔트(`0600`) 단방향 해시(`doc_ref`/`query_ref`) 및 외부 전송 배제<br>- 로그 용량 상한(10MB × 3 회전) 및 로깅 장애 시 본 요청 무영향(Fail-Open) | §5.1<br>[`EPIC-OBS-01`](requirements/features/EPIC-OBS-01.md)<br>(`REQ-OBS-003`, `REQ-OBS-004`) |
+| **이식성·범용성·코어 격리**<br>(Portability & Isolation) | 특정 AI 클라이언트·외부 런타임·서드파티 생태계에 종속되지 않는 독립 배포와 핵심 비즈니스 로직 보호 | - 외부 크레이트 0개(Zero External Dependencies) 및 단일 정적 바이너리 배포 (§1, §3)<br>- Stdio Session Proxy와 Vault Server 분리로 MCP 클라이언트 범용 호환 (§2)<br>- 물리 저장소(`DocumentStore`, `IndexStore`)를 Rust Trait으로 격리하여 코어 파이프라인 독립성 유지 (§5) | [`CONSTITUTION.md`](../CONSTITUTION.md) §1–§2<br>§1, §2, §3, §5 |

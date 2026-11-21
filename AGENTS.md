@@ -1,7 +1,7 @@
 # omk (oh my knowledge) - System Instructions
 
 ## 1. AI Collaboration Rules (AI 협업 지침)
-- **Think Before Code:** 코드를 수정하기 전, 변경 사항이 아키텍처 원칙에 부합하는지 단계별로 생각(Step-by-step thinking)하고 사용자에게 짧게 브리핑하라.
+- **Think Before Code:** 코드를 작성·수정하기 전 단순히 기능 동작 여부만 보지 말고, [`CONSTITUTION.md`](CONSTITUTION.md) §1과 [`docs/architecture.md`](docs/architecture.md) §6에 정의된 **품질 속성을 향한 일련의 의도(Chain of Intentionality)**를 먼저 파악하여 단계별로 검토하고 사용자에게 짧게 브리핑하라. 품질 속성에 직결된 아키텍처적 세부 제약은 사전 승인([`CONSTITUTION.md`](CONSTITUTION.md) §2) 없이 절대 임의로 우회하거나 완화하지 말고, 그 외 일반 구현 세부 사항만 유연하게 다루라.
 - **Discuss Trade-offs:** 트레이드 오프(성능, 복잡도, UX 등)가 발생하는 모든 결정 사항은 투명하게 드러내고, 거버넌스 원칙에 따라 반드시 사용자와 합의한 후 진행하라.
 - **Atomic Commits:** 한 번에 너무 많은 책임을 가진 코드를 작성하지 마라. 테스트 가능한 최소 단위로 나누어 구현하라.
 - **No Hallucination in APIs:** 표준 라이브러리나 명확히 명시된 패키지 외에 존재하지 않는 의존성을 가상으로 만들어내지 마라.

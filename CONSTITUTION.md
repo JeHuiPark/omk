@@ -1,6 +1,9 @@
 # omk (oh my knowledge) - Project Constitution
 
 ## 1. Architecture & Design Principles
+- **Intentionality & Quality Attributes (일련의 의도와 품질 속성 중심 아키텍처):**
+  - 아키텍처는 단순히 기능이 동작하도록 구조를 나누는 일이 아니라, 목표 품질 속성(성능, 보안·프라이버시, 데이터 무결성, 이식성)을 가장 효과적으로 달성하기 위해 최상위 설계 의도부터 핵심 하위 세부 사항까지 일관되게 연결하고 제약하는 **일련의 의도(Chain of Intentionality)**다.
+  - 거시적 구조와 미시적 구현 세부 사항을 인위적인 경계로 나누지 않는다. 시스템 전반의 품질 속성 달성에 직결되는 세부 사항은 아키텍처적 제약으로 엄격히 통제하고, 그 외의 일반 세부 사항은 합리적인 구현 자율성에 열어둔다.
 - **Agent-Agnostic (에이전트 범용성):** 특정 플랫폼이나 AI 클라이언트(IDE 등)에 종속되지 않는 범용성을 유지한다.
 - **Environment Isolation (환경 독립성):** 사용자 로컬 환경의 제약이나 특정 런타임에 의존하지 않고 독립적으로 동작할 수 있어야 한다.
 - **Core Isolation (코어 격리):** 핵심 비즈니스 로직은 통신 방식이나 외부 인프라의 변화로부터 안전하게 격리되어 보호되어야 한다.
@@ -13,6 +16,7 @@
 ### 3.1 Core Principles (기본 원칙)
 - **Update First:** 코드를 작성하거나 수정하기 전, 기획의 단일 진실 공급원(SSOT)인 [`docs/requirements/index.md`](docs/requirements/index.md)를 우선 최신화하라. 구두 합의만으로 코드를 구현하지 않는다.
 - **Problem-Driven:** 사용자의 표면적 지시(How)에 맹목적으로 따르지 마라. 본질적 목적(What/Why)을 파악하고, 빈틈이 있다면 구현 전 역제안하라.
+- **Quality-Driven Intentionality (품질 속성 중심의 의도·제약 명세):** 요구사항을 정의하고 설계할 때 단순한 기능 동작 명세에 그치지 않고, **목표 품질 속성(Quality Attribute) → 아키텍처적 의도(High-level Intent) → 강제되는 핵심 세부 제약(Low-level Constraint / Invariant)**의 연결 고리를 명확히 정의하고 검증 기준까지 함께 명문화하라.
 - **Traceable Coding:** 기획 문서에 명시되지 않은 기능을 임의로 확장(Over-engineering)하지 마라. 모든 코드는 명시된 요구사항을 달성하기 위한 목적만 가져야 한다.
 - **Impact Analysis & Deduplication (간섭 및 중복 해결):** 요구사항이 축적되는 과정에서 새로운 요구사항이 기존 기능과 충돌하거나 중복(Overlapping)되는지 반드시 사전 검토하라. 간섭이나 중복이 발생할 경우 무분별하게 새 ID를 늘리지 말고, 기존 요구사항을 병합(Merge)하거나 갱신하여 문서의 파편화와 논리적 모순을 방지해야 한다. 해결 방향은 사용자와 합의 후 진행한다.
 
