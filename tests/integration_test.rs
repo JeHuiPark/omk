@@ -868,3 +868,337 @@ fn test_cli_omk_bench_verifies_all_8_static_invariants() {
         assert!(passed, "Static invariant {} failed in omk bench", id);
     }
 }
+
+#[test]
+fn test_mcp_server_discover_and_standard_discovery_probes() {
+    let vault_dir = unique_test_dir("mcp_discover");
+    let daemon_cfg = DaemonConfig::new(&vault_dir).expect("daemon config");
+    let server = DaemonServer::initialize(daemon_cfg.clone()).expect("init daemon");
+    let shutdown = server.shutdown_handle();
+
+    let server_thread = thread::spawn(move || {
+        server.run_blocking().expect("daemon run_blocking");
+    });
+
+    let mut proxy_cfg = ProxyConfig::new(&vault_dir).expect("proxy config");
+    proxy_cfg.auto_spawn_daemon = false;
+    proxy_cfg.max_connect_retries = 20;
+    proxy_cfg.base_backoff_ms = 10;
+    let proxy = McpProxy::new(proxy_cfg);
+
+    // 1. `server/discover` must succeed without -32601 and return serverInfo, capabilities, and tools
+    let discover_req = r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"antigravity","version":"1.0"}}}"#;
+    let discover_resp = proxy
+        .forward_line(discover_req)
+        .expect("server/discover response");
+    let discover_json = JsonValue::parse(&discover_resp).expect("parse discover json");
+    assert!(
+        discover_json.get("error").is_none(),
+        "server/discover must not return JSON-RPC error: {}",
+        discover_resp
+    );
+    let result = discover_json.get("result").expect("discover result object");
+    assert_eq!(
+        result.get("protocolVersion").and_then(JsonValue::as_str),
+        Some("2024-11-05")
+    );
+    assert_eq!(
+        result
+            .get("serverInfo")
+            .and_then(|s| s.get("name"))
+            .and_then(JsonValue::as_str),
+        Some("omk")
+    );
+    assert_eq!(
+        result
+            .get("serverInfo")
+            .and_then(|s| s.get("version"))
+            .and_then(JsonValue::as_str),
+        Some("0.1.0")
+    );
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("tools"))
+            .and_then(JsonValue::as_object)
+            .is_some(),
+        "capabilities.tools must be an object"
+    );
+    let tools = result
+        .get("tools")
+        .and_then(JsonValue::as_array)
+        .expect("tools array in discover result");
+    assert_eq!(tools.len(), 3);
+    let tool_names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(JsonValue::as_str))
+        .collect();
+    assert!(tool_names.contains(&"upsert_knowledge"));
+    assert!(tool_names.contains(&"search_knowledge"));
+    assert!(tool_names.contains(&"read_knowledge"));
+
+    // 2. Standard MCP discovery probes return empty lists instead of -32601 errors
+    for (id, method, key) in [
+        (2, "resources/list", "resources"),
+        (3, "resources/templates/list", "resourceTemplates"),
+        (4, "prompts/list", "prompts"),
+    ] {
+        let req = format!(r#"{{"jsonrpc":"2.0","id":{},"method":"{}"}}"#, id, method);
+        let resp = proxy.forward_line(&req).expect("probe response");
+        let parsed = JsonValue::parse(&resp).expect("parse probe json");
+        assert!(
+            parsed.get("error").is_none(),
+            "{} must not return an error: {}",
+            method,
+            resp
+        );
+        let arr = parsed
+            .get("result")
+            .and_then(|r| r.get(key))
+            .and_then(JsonValue::as_array)
+            .expect("empty list array");
+        assert!(arr.is_empty(), "{} must return an empty '{}' array", method, key);
+    }
+
+    shutdown.store(true, Ordering::SeqCst);
+    server_thread.join().expect("daemon thread join");
+
+    // Verify telemetry recorded 4 successful control RPCs and 0 errors; `--last 2` falls back cleanly
+    let stats_all = compute_telemetry_stats(&daemon_cfg.paths, None, 50.0);
+    assert_eq!(stats_all.total_requests, 4);
+    assert_eq!(stats_all.succeeded_requests, 4);
+    assert_eq!(stats_all.failed_requests, 0);
+    assert_eq!(stats_all.tool_requests, 0);
+    assert_eq!(stats_all.control_requests, 4);
+    assert_eq!(stats_all.control_succeeded_requests, 4);
+    assert_eq!(stats_all.control_failed_requests, 0);
+    assert_eq!(stats_all.metrics_scope, "all_rpc");
+    assert_eq!(stats_all.latency_by_tool.get("all").map(|d| d.count), Some(4));
+    assert_eq!(
+        stats_all.latency_by_tool.get("control_rpc").map(|d| d.count),
+        Some(4)
+    );
+
+    let stats_last2 = compute_telemetry_stats(&daemon_cfg.paths, Some(2), 50.0);
+    assert_eq!(stats_last2.total_requests, 2);
+    assert_eq!(stats_last2.control_requests, 2);
+    assert_eq!(stats_last2.tool_requests, 0);
+    assert_eq!(stats_last2.metrics_scope, "all_rpc");
+
+    let _ = fs::remove_dir_all(&vault_dir);
+}
+
+#[test]
+fn test_stats_separates_control_rpcs_and_preserves_last_n_tool_metrics() {
+    let vault_dir = unique_test_dir("stats_separation");
+    let daemon_cfg = DaemonConfig::new(&vault_dir).expect("daemon config");
+    let server = DaemonServer::initialize(daemon_cfg.clone()).expect("init daemon");
+    let shutdown = server.shutdown_handle();
+
+    let server_thread = thread::spawn(move || {
+        server.run_blocking().expect("daemon run_blocking");
+    });
+
+    let mut proxy_cfg = ProxyConfig::new(&vault_dir).expect("proxy config");
+    proxy_cfg.auto_spawn_daemon = false;
+    proxy_cfg.max_connect_retries = 20;
+    proxy_cfg.base_backoff_ms = 10;
+    let proxy = McpProxy::new(proxy_cfg);
+
+    let mut rpc_id = 1usize;
+    let send_handshake = |id: &mut usize| {
+        for method in ["server/discover", "initialize", "tools/list"] {
+            let req = format!(r#"{{"jsonrpc":"2.0","id":{},"method":"{}"}}"#, *id, method);
+            *id += 1;
+            let resp = proxy.forward_line(&req).expect("handshake response");
+            assert!(
+                !resp.contains("\"error\""),
+                "handshake {} failed: {}",
+                method,
+                resp
+            );
+        }
+    };
+
+    // 1. Leading handshakes (3 sessions = 9 control RPCs)
+    for _ in 0..3 {
+        send_handshake(&mut rpc_id);
+    }
+
+    // 2. Real knowledge tool calls (3 calls: upsert, search, read)
+    let upsert_req = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"upsert_knowledge","arguments":{{"id":"stats-sep-doc","title":"Control vs Tool Metrics Separation","content":"Detailed architecture guidance on separating MCP session control RPCs from actual knowledge tool telemetry statistics so averages and last-N windows stay accurate.","source":{{"class":"USER_EXPLICIT","type":"WIKI","provider":"local"}},"tags":["observability","mcp"]}}}}}}"#,
+        rpc_id
+    );
+    rpc_id += 1;
+    let upsert_resp = proxy.forward_line(&upsert_req).expect("upsert response");
+    assert!(!upsert_resp.contains("\"error\""));
+
+    let search_req = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"search_knowledge","arguments":{{"query":"telemetry separation","limit":5}}}}}}"#,
+        rpc_id
+    );
+    rpc_id += 1;
+    let search_resp = proxy.forward_line(&search_req).expect("search response");
+    assert!(!search_resp.contains("\"error\""));
+
+    let read_req = format!(
+        r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"name":"read_knowledge","arguments":{{"id":"stats-sep-doc"}}}}}}"#,
+        rpc_id
+    );
+    rpc_id += 1;
+    let read_resp = proxy.forward_line(&read_req).expect("read response");
+    assert!(!read_resp.contains("\"error\""));
+
+    // 3. Trailing handshakes (4 sessions = 12 control RPCs after the last tool call)
+    for _ in 0..4 {
+        send_handshake(&mut rpc_id);
+    }
+
+    shutdown.store(true, Ordering::SeqCst);
+    server_thread.join().expect("daemon thread join");
+
+    // 4. Verify `compute_telemetry_stats(..., Some(2), ...)` is NOT crowded out by the 12 trailing handshakes
+    let report_last2 = compute_telemetry_stats(&daemon_cfg.paths, Some(2), 50.0);
+    assert_eq!(report_last2.tool_requests, 2);
+    assert_eq!(report_last2.tool_succeeded_requests, 2);
+    assert_eq!(report_last2.tool_failed_requests, 0);
+    assert_eq!(report_last2.control_requests, 12);
+    assert_eq!(report_last2.control_succeeded_requests, 12);
+    assert_eq!(report_last2.control_failed_requests, 0);
+    assert_eq!(report_last2.total_requests, 14);
+    assert_eq!(report_last2.succeeded_requests, 14);
+    assert_eq!(report_last2.failed_requests, 0);
+    assert_eq!(report_last2.metrics_scope, "tool_calls");
+    assert_eq!(
+        report_last2.latency_by_tool.get("all").map(|d| d.count),
+        Some(2),
+        "latency_by_tool['all'] must aggregate only tool calls when tool_requests > 0"
+    );
+    assert_eq!(
+        report_last2
+            .latency_by_tool
+            .get("upsert_knowledge")
+            .map(|d| d.count),
+        Some(0),
+        "3rd-from-last tool call (upsert_knowledge) must be outside --last 2"
+    );
+    assert_eq!(
+        report_last2
+            .latency_by_tool
+            .get("search_knowledge")
+            .map(|d| d.count),
+        Some(1)
+    );
+    assert_eq!(
+        report_last2
+            .latency_by_tool
+            .get("read_knowledge")
+            .map(|d| d.count),
+        Some(1)
+    );
+    assert_eq!(
+        report_last2
+            .latency_by_tool
+            .get("control_rpc")
+            .map(|d| d.count),
+        Some(12)
+    );
+    assert!(
+        report_last2.tokens_avg >= 10.0,
+        "tokens_avg ({}) must reflect tool payloads and not be diluted by 12 zero-token control RPCs",
+        report_last2.tokens_avg
+    );
+
+    // 5. Verify CLI `omk stats --last 2 --json`, human `omk stats --last 2`, and `omk status --json`
+    let bin = env!("CARGO_BIN_EXE_omk");
+    let stats_json_out = Command::new(bin)
+        .args([
+            "stats",
+            "--vault",
+            vault_dir.to_str().unwrap(),
+            "--last",
+            "2",
+            "--json",
+        ])
+        .output()
+        .expect("run omk stats --last 2 --json");
+    assert!(stats_json_out.status.success());
+    let stats_json =
+        JsonValue::parse(String::from_utf8_lossy(&stats_json_out.stdout).trim())
+            .expect("parse stats json");
+    let overview = stats_json.get("overview").expect("overview");
+    assert_eq!(
+        overview.get("tool_requests").and_then(JsonValue::as_f64),
+        Some(2.0)
+    );
+    assert_eq!(
+        overview.get("control_requests").and_then(JsonValue::as_f64),
+        Some(12.0)
+    );
+    assert_eq!(
+        overview.get("total_requests").and_then(JsonValue::as_f64),
+        Some(14.0)
+    );
+    assert_eq!(
+        overview.get("failed_requests").and_then(JsonValue::as_f64),
+        Some(0.0)
+    );
+    assert_eq!(
+        overview.get("metrics_scope").and_then(JsonValue::as_str),
+        Some("tool_calls")
+    );
+    let lat_ms = stats_json.get("latency_ms").expect("latency_ms");
+    assert_eq!(
+        lat_ms
+            .get("all")
+            .and_then(|d| d.get("count"))
+            .and_then(JsonValue::as_f64),
+        Some(2.0)
+    );
+    assert_eq!(
+        lat_ms
+            .get("control_rpc")
+            .and_then(|d| d.get("count"))
+            .and_then(JsonValue::as_f64),
+        Some(12.0)
+    );
+
+    let stats_human_out = Command::new(bin)
+        .args(["stats", "--vault", vault_dir.to_str().unwrap(), "--last", "2"])
+        .output()
+        .expect("run omk stats --last 2");
+    assert!(stats_human_out.status.success());
+    let human_stdout = String::from_utf8_lossy(&stats_human_out.stdout);
+    assert!(human_stdout.contains("Knowledge Tool Calls  : 2 (2 succeeded, 0 failed)"));
+    assert!(human_stdout.contains("Session Control RPCs  : 12 (12 succeeded, 0 failed)"));
+    assert!(human_stdout.contains("control_rpc"));
+
+    let status_json_out = Command::new(bin)
+        .args(["status", "--vault", vault_dir.to_str().unwrap(), "--json"])
+        .output()
+        .expect("run omk status --json");
+    assert!(status_json_out.status.success());
+    let status_json =
+        JsonValue::parse(String::from_utf8_lossy(&status_json_out.stdout).trim())
+            .expect("parse status json");
+    let obs = status_json.get("observability").expect("observability");
+    assert_eq!(
+        obs.get("tool_requests").and_then(JsonValue::as_f64),
+        Some(3.0)
+    );
+    assert_eq!(
+        obs.get("control_requests").and_then(JsonValue::as_f64),
+        Some(21.0)
+    );
+    assert_eq!(
+        obs.get("total_requests").and_then(JsonValue::as_f64),
+        Some(24.0)
+    );
+    assert_eq!(
+        obs.get("failed_requests").and_then(JsonValue::as_f64),
+        Some(0.0)
+    );
+
+    let _ = fs::remove_dir_all(&vault_dir);
+}
