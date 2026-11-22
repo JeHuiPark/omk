@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-11-22
+
+### Features
+
+- **cli:** Add disk safety thresholds and confirmation prompt to omk bench (#7) (de4d8e2)
+
 ## [v0.1.0] - 2026-11-21
 
 ### Features
