@@ -25,8 +25,9 @@ use omk::agent_prompt::{
     HarnessSelection,
 };
 use omk::daemon::{
-    compute_telemetry_stats, reset_telemetry_logs, run_synthetic_benchmark, BenchmarkReport,
-    DaemonConfig, DaemonPaths, DaemonServer, TelemetryStatsReport,
+    compute_telemetry_stats, estimate_bench_disk_bytes, format_byte_size, reset_telemetry_logs,
+    run_synthetic_benchmark, BenchmarkReport, DaemonConfig, DaemonPaths, DaemonServer,
+    TelemetryStatsReport, BENCH_MAX_DOCS, BENCH_MAX_TURNS, BENCH_WARN_DOCS, BENCH_WARN_TURNS,
 };
 use omk::protocol::format_rpc_error;
 use omk::proxy::{McpProxy, ProxyConfig};
@@ -121,8 +122,48 @@ pub struct CliOptions {
     pub bench_docs: usize,
     /// Number of simulated user turns in `omk bench` (`--turns <T>`, default 80).
     pub bench_turns: usize,
+    /// Whether interactive confirmation prompts should be automatically approved (`--yes` / `-y`).
+    pub assume_yes: bool,
     /// Whether machine-readable single-line JSON output was requested (`--json`).
     pub json_output: bool,
+}
+
+fn validate_bench_docs(val: &str, flag_name: &str) -> Result<usize, String> {
+    let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+        format!(
+            "Option '{}' requires a positive integer (1..={}), but found '{}'.",
+            flag_name, BENCH_MAX_DOCS, val
+        )
+    })?;
+    if parsed > BENCH_MAX_DOCS {
+        let est = format_byte_size(estimate_bench_disk_bytes(parsed, 80));
+        return Err(format!(
+            "Option '{}' value {} (~{} estimated temporary disk usage) exceeds the maximum allowed safety limit of {} (~{}).\n[HINT] Use '--docs {}' or lower to prevent disk and inode exhaustion.",
+            flag_name,
+            parsed,
+            est,
+            BENCH_MAX_DOCS,
+            format_byte_size(estimate_bench_disk_bytes(BENCH_MAX_DOCS, 80)),
+            BENCH_MAX_DOCS
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_bench_turns(val: &str, flag_name: &str) -> Result<usize, String> {
+    let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+        format!(
+            "Option '{}' requires a positive integer (1..={}), but found '{}'.",
+            flag_name, BENCH_MAX_TURNS, val
+        )
+    })?;
+    if parsed > BENCH_MAX_TURNS {
+        return Err(format!(
+            "Option '{}' value {} exceeds the maximum allowed safety limit of {}.\n[HINT] Use '--turns {}' or lower.",
+            flag_name, parsed, BENCH_MAX_TURNS, BENCH_MAX_TURNS
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Strictly parses command-line arguments (`REQ-CLI-001`, `REQ-OBS-005`, `REQ-PERF-006`).
@@ -138,6 +179,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
     let mut reset_stats = false;
     let mut bench_docs: usize = 3000;
     let mut bench_turns: usize = 80;
+    let mut assume_yes = false;
     let mut json_output = false;
     let mut help_requested = false;
     let mut version_requested = false;
@@ -158,6 +200,10 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                 json_output = true;
                 i += 1;
             }
+            "--yes" | "-y" => {
+                assume_yes = true;
+                i += 1;
+            }
             "--reset" => {
                 reset_stats = true;
                 i += 1;
@@ -167,13 +213,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     "Option '--docs' requires a positive integer document count.\n[HINT] Example: omk bench --docs 3000"
                         .to_string()
                 })?;
-                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    format!(
-                        "Option '--docs' requires a positive integer, but found '{}'.",
-                        val
-                    )
-                })?;
-                bench_docs = parsed;
+                bench_docs = validate_bench_docs(val, "--docs")?;
                 i += 2;
             }
             "--turns" => {
@@ -181,13 +221,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
                     "Option '--turns' requires a positive integer turn count.\n[HINT] Example: omk bench --turns 80"
                         .to_string()
                 })?;
-                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    format!(
-                        "Option '--turns' requires a positive integer, but found '{}'.",
-                        val
-                    )
-                })?;
-                bench_turns = parsed;
+                bench_turns = validate_bench_turns(val, "--turns")?;
                 i += 2;
             }
             "--last" => {
@@ -296,24 +330,12 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
             }
             _ if arg.starts_with("--docs=") => {
                 let val = &arg["--docs=".len()..];
-                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    format!(
-                        "Option '--docs=' requires a positive integer, but found '{}'.",
-                        val
-                    )
-                })?;
-                bench_docs = parsed;
+                bench_docs = validate_bench_docs(val, "--docs=")?;
                 i += 1;
             }
             _ if arg.starts_with("--turns=") => {
                 let val = &arg["--turns=".len()..];
-                let parsed = val.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                    format!(
-                        "Option '--turns=' requires a positive integer, but found '{}'.",
-                        val
-                    )
-                })?;
-                bench_turns = parsed;
+                bench_turns = validate_bench_turns(val, "--turns=")?;
                 i += 1;
             }
             _ if arg.starts_with("--last=") => {
@@ -407,6 +429,7 @@ fn parse_cli_args_from(args: &[String], is_tty: bool) -> Result<CliOptions, Stri
         reset_stats,
         bench_docs,
         bench_turns,
+        assume_yes,
         json_output,
     })
 }
@@ -440,8 +463,9 @@ OPTIONS:
       --last <N>         Analyze only the most recent N RPC requests in 'omk stats'
       --slow-ms <MS>     Threshold in ms for slow request anomalies in 'omk stats' [default: 50]
       --reset            Clear local telemetry log files in 'omk stats'
-      --docs <N>         Number of synthetic documents to seed in 'omk bench' [default: 3000]
-      --turns <T>        Number of simulated user turns in 'omk bench' [default: 80]
+      --docs <N>         Number of synthetic documents to seed in 'omk bench' [default: 3000, max: 100000]
+      --turns <T>        Number of simulated user turns in 'omk bench' [default: 80, max: 10000]
+  -y, --yes              Skip interactive confirmation prompt in 'omk bench'
       --json             Output machine-readable single-line JSON
   -V, --version          Display version information
   -h, --help             Display help information
@@ -1187,7 +1211,81 @@ fn format_stats_human(
     out
 }
 
-fn run_bench_command(docs_count: usize, turns_count: usize, json_output: bool) -> Result<(), OmkError> {
+fn format_bench_preflight_summary(docs_count: usize, turns_count: usize) -> String {
+    let effective_docs = docs_count.max(5);
+    let effective_turns = turns_count.max(4);
+    let est_bytes = estimate_bench_disk_bytes(effective_docs, effective_turns);
+    let est_human = format_byte_size(est_bytes);
+
+    let mut out = String::new();
+    if effective_docs > BENCH_WARN_DOCS {
+        out.push_str(&format!(
+            "[WARN] Document count (--docs {}) exceeds recommended threshold ({}).\n       High temporary disk I/O (~{}) and longer seeding/cleanup time expected.\n",
+            effective_docs, BENCH_WARN_DOCS, est_human
+        ));
+    }
+    if effective_turns > BENCH_WARN_TURNS {
+        out.push_str(&format!(
+            "[WARN] Turn count (--turns {}) exceeds recommended threshold ({}).\n",
+            effective_turns, BENCH_WARN_TURNS
+        ));
+    }
+    out.push_str(&format!(
+        "[BENCHMARK PRE-FLIGHT]\n  Seeded Documents (--docs) : {} (warn threshold: {}, max: {})\n  Simulated Turns (--turns) : {} (warn threshold: {}, max: {})\n  Estimated Temp Disk Usage : ~{} in OS temp dir (auto-cleaned on exit)\n",
+        effective_docs,
+        BENCH_WARN_DOCS,
+        BENCH_MAX_DOCS,
+        effective_turns,
+        BENCH_WARN_TURNS,
+        BENCH_MAX_TURNS,
+        est_human
+    ));
+    out
+}
+
+fn parse_confirmation_input(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn run_bench_command(
+    docs_count: usize,
+    turns_count: usize,
+    assume_yes: bool,
+    json_output: bool,
+    is_tty: bool,
+) -> Result<(), OmkError> {
+    let effective_docs = docs_count.max(5);
+    let effective_turns = turns_count.max(4);
+    let exceeds_warn = effective_docs > BENCH_WARN_DOCS || effective_turns > BENCH_WARN_TURNS;
+
+    let preflight = format_bench_preflight_summary(effective_docs, effective_turns);
+
+    if !assume_yes {
+        if !json_output && is_tty {
+            eprint!("{}Proceed with benchmark? [y/N]: ", preflight);
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| OmkError::InternalError(format!("Failed to read user confirmation: {}", e)))?;
+            if !parse_confirmation_input(&line) {
+                eprintln!("Benchmark cancelled by user (0 bytes written).");
+                return Ok(());
+            }
+            eprintln!();
+        } else if exceeds_warn {
+            let est_human = format_byte_size(estimate_bench_disk_bytes(effective_docs, effective_turns));
+            return Err(OmkError::InvalidRequest(format!(
+                "Benchmark workload (--docs {}, --turns {}, ~{} estimated disk usage) exceeds recommended threshold (--docs {}, --turns {}) in non-interactive mode. Pass '--yes' ('-y') to confirm execution.",
+                effective_docs, effective_turns, est_human, BENCH_WARN_DOCS, BENCH_WARN_TURNS
+            )));
+        } else if !json_output {
+            eprintln!("{}", preflight);
+        }
+    } else if !json_output {
+        eprintln!("{}", preflight);
+    }
+
     let report = run_synthetic_benchmark(docs_count, turns_count)?;
     if json_output {
         println!("{}", format_bench_json(&report));
@@ -1437,7 +1535,13 @@ fn execute_cli(opts: CliOptions, is_tty: bool) -> Result<(), OmkError> {
             opts.reset_stats,
             opts.json_output,
         ),
-        Subcommand::Bench => run_bench_command(opts.bench_docs, opts.bench_turns, opts.json_output),
+        Subcommand::Bench => run_bench_command(
+            opts.bench_docs,
+            opts.bench_turns,
+            opts.assume_yes,
+            opts.json_output,
+            is_tty,
+        ),
         Subcommand::Reconcile => {
             let paths = DaemonPaths::resolve(&opts.vault_dir)?;
             let doc_store = Arc::new(LocalMarkdownDocumentStore::new(&paths.vault_dir)?);
@@ -1594,12 +1698,52 @@ mod tests {
             "--docs".to_string(),
             "3000".to_string(),
             "--turns=80".to_string(),
+            "--yes".to_string(),
             "--json".to_string(),
         ];
         let opts = parse_cli_args_from(&args, true).expect("valid bench args");
         assert_eq!(opts.subcommand, Subcommand::Bench);
         assert_eq!(opts.bench_docs, 3000);
         assert_eq!(opts.bench_turns, 80);
+        assert!(opts.assume_yes);
         assert!(opts.json_output);
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_excessive_bench_docs_and_turns() {
+        let huge_docs = vec![
+            "bench".to_string(),
+            "--docs".to_string(),
+            "123012301".to_string(),
+        ];
+        let err = parse_cli_args_from(&huge_docs, true).expect_err("should reject > BENCH_MAX_DOCS");
+        assert!(err.contains("exceeds the maximum allowed safety limit"));
+        assert!(err.contains("100000"));
+
+        let huge_turns = vec!["bench".to_string(), "--turns=50000".to_string()];
+        let err2 =
+            parse_cli_args_from(&huge_turns, true).expect_err("should reject > BENCH_MAX_TURNS");
+        assert!(err2.contains("exceeds the maximum allowed safety limit"));
+        assert!(err2.contains("10000"));
+    }
+
+    #[test]
+    fn test_bench_preflight_summary_and_confirmation_parsing() {
+        let normal_summary = format_bench_preflight_summary(3000, 80);
+        assert!(normal_summary.contains("[BENCHMARK PRE-FLIGHT]"));
+        assert!(normal_summary.contains("Estimated Temp Disk Usage"));
+        assert!(!normal_summary.contains("[WARN]"));
+
+        let warn_summary = format_bench_preflight_summary(25000, 1500);
+        assert!(warn_summary.contains("[WARN] Document count (--docs 25000) exceeds recommended threshold (10000)"));
+        assert!(warn_summary.contains("[WARN] Turn count (--turns 1500) exceeds recommended threshold (1000)"));
+        assert!(warn_summary.contains("Estimated Temp Disk Usage"));
+
+        assert!(parse_confirmation_input("y\n"));
+        assert!(parse_confirmation_input("YES\r\n"));
+        assert!(parse_confirmation_input("  Y  "));
+        assert!(!parse_confirmation_input(""));
+        assert!(!parse_confirmation_input("n\n"));
+        assert!(!parse_confirmation_input("no"));
     }
 }

@@ -1738,6 +1738,71 @@ fn find_dominant_span(timings: &JsonValue) -> String {
 // Deterministic Static Invariant & Synthetic Workload Benchmark (`REQ-PERF-006`)
 // ============================================================================
 
+/// Soft warning threshold for `--docs` in `omk bench` (`REQ-PERF-006`).
+pub const BENCH_WARN_DOCS: usize = 10_000;
+
+/// Absolute maximum allowed `--docs` in `omk bench` to prevent disk/inode exhaustion (`REQ-PERF-006`).
+pub const BENCH_MAX_DOCS: usize = 100_000;
+
+/// Soft warning threshold for `--turns` in `omk bench` (`REQ-PERF-006`).
+pub const BENCH_WARN_TURNS: usize = 1_000;
+
+/// Absolute maximum allowed `--turns` in `omk bench` (`REQ-PERF-006`).
+pub const BENCH_MAX_TURNS: usize = 10_000;
+
+/// Estimates peak temporary disk usage in bytes for a benchmark of `docs_count` documents and `turns_count` turns.
+///
+/// Accounts for:
+/// - 4,096 bytes per Markdown file (filesystem 4 KB block allocation)
+/// - ~3,584 bytes per indexed document in SQLite FTS5 (`index.db` + WAL journal + B-Tree directory entries)
+/// - ~4,096 bytes per upsert turn (25% of turns write a document + telemetry log entry)
+/// - 512 KB base overhead for SQLite schema, WAL header, socket, and telemetry metadata
+pub fn estimate_bench_disk_bytes(docs_count: usize, turns_count: usize) -> u64 {
+    let effective_docs = docs_count.max(5) as u64;
+    let effective_turns = turns_count.max(4) as u64;
+    let base_overhead: u64 = 512 * 1024;
+    let per_doc_bytes: u64 = 4096 + 3584; // ~7.5 KB per document
+    let upsert_turns = (effective_turns + 3) / 4;
+    let per_turn_bytes: u64 = upsert_turns * 4096 + effective_turns * 512;
+    base_overhead
+        .saturating_add(effective_docs.saturating_mul(per_doc_bytes))
+        .saturating_add(per_turn_bytes)
+}
+
+/// Formats a byte count into a human-readable string (`KB`, `MB`, or `GB`).
+pub fn format_byte_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} KB", b / KB)
+    }
+}
+
+/// RAII guard that guarantees the temporary benchmark directory is removed on drop,
+/// even if an early error (`?`) or panic occurs during seeding or workload execution.
+struct TempBenchDirGuard {
+    path: PathBuf,
+}
+
+impl TempBenchDirGuard {
+    fn new(path: PathBuf) -> Self {
+        let _ = fs::remove_dir_all(&path);
+        Self { path }
+    }
+}
+
+impl Drop for TempBenchDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Result of a single deterministic static invariant check (`MET-STATIC-01` .. `MET-STATIC-08`).
 #[derive(Debug, Clone)]
 pub struct StaticInvariantCheck {
@@ -1800,6 +1865,19 @@ pub fn run_synthetic_benchmark(
     let effective_docs = docs_count.max(5);
     let effective_turns = turns_count.max(4);
 
+    if effective_docs > BENCH_MAX_DOCS {
+        return Err(OmkError::InvalidRequest(format!(
+            "Document count (--docs {}) exceeds maximum allowed limit ({}).",
+            effective_docs, BENCH_MAX_DOCS
+        )));
+    }
+    if effective_turns > BENCH_MAX_TURNS {
+        return Err(OmkError::InvalidRequest(format!(
+            "Turn count (--turns {}) exceeds maximum allowed limit ({}).",
+            effective_turns, BENCH_MAX_TURNS
+        )));
+    }
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1809,7 +1887,7 @@ pub fn run_synthetic_benchmark(
         std::process::id(),
         nanos
     ));
-    let _ = fs::remove_dir_all(&bench_dir);
+    let _bench_dir_guard = TempBenchDirGuard::new(bench_dir.clone());
     let vault_dir = bench_dir.join("vault");
     let daemon_cfg = DaemonConfig::new(&vault_dir)?;
 
