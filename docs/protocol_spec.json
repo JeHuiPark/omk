@@ -2,7 +2,7 @@
   "jsonrpc": "2.0",
   "protocolVersion": "2024-11-05",
   "name": "omk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "omk (oh my knowledge) MCP & JSON-RPC 2.0 Protocol Specification",
   "lifecycle": {
     "server/discover": {
@@ -19,7 +19,7 @@
         },
         "serverInfo": {
           "name": "omk",
-          "version": "0.1.0"
+          "version": "0.2.0"
         },
         "tools": [
           "upsert_knowledge",
@@ -42,7 +42,7 @@
         },
         "serverInfo": {
           "name": "omk",
-          "version": "0.1.0"
+          "version": "0.2.0"
         }
       }
     },
