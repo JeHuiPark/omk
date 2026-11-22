@@ -867,6 +867,35 @@ fn test_cli_omk_bench_verifies_all_8_static_invariants() {
         let passed = inv.get("passed").and_then(JsonValue::as_bool).unwrap_or(false);
         assert!(passed, "Static invariant {} failed in omk bench", id);
     }
+
+    // Verify safety guard rejects excessive --docs above BENCH_MAX_DOCS (100,000)
+    let excessive_out = Command::new(bin)
+        .args(["bench", "--docs", "123012301"])
+        .output()
+        .expect("run omk bench with excessive docs");
+    assert!(!excessive_out.status.success());
+    let excessive_stderr = String::from_utf8_lossy(&excessive_out.stderr);
+    assert!(excessive_stderr.contains("exceeds the maximum allowed safety limit of 100000"));
+
+    // Verify non-interactive execution above warning threshold (10,000) requires --yes
+    let warn_blocked_out = Command::new(bin)
+        .args(["bench", "--docs", "10001", "--turns", "4"])
+        .output()
+        .expect("run omk bench above warn threshold without --yes");
+    assert!(!warn_blocked_out.status.success());
+    let warn_stderr = String::from_utf8_lossy(&warn_blocked_out.stderr);
+    assert!(warn_stderr.contains("exceeds recommended threshold"));
+    assert!(warn_stderr.contains("Pass '--yes' ('-y')"));
+
+    // Verify human pre-flight output displays estimated disk usage
+    let human_yes_out = Command::new(bin)
+        .args(["bench", "--docs", "20", "--turns", "4", "--yes"])
+        .output()
+        .expect("run omk bench --yes");
+    assert!(human_yes_out.status.success());
+    let human_stderr = String::from_utf8_lossy(&human_yes_out.stderr);
+    assert!(human_stderr.contains("[BENCHMARK PRE-FLIGHT]"));
+    assert!(human_stderr.contains("Estimated Temp Disk Usage"));
 }
 
 #[test]

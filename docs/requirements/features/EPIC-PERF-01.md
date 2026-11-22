@@ -214,7 +214,12 @@ T_{\text{year}} &= 250 \text{ days/year} \times 80 \text{ turns/day} = 20,000 \t
     - `LocalMarkdownDocumentStore`는 누적 파일 본문 파싱 횟수(`parse_count()`) 및 파일 쓰기 횟수(`write_count()`)를 조회할 수 있는 원자적 카운터 메서드를 제공해야 한다.
     - `McpProxy` 및 `DaemonServer`는 누적 소켓 연결 횟수(`connect_count()` / `accepted_connections()`)를 조회할 수 있는 원자적 카운터 메서드를 제공해야 한다.
   - **`omk bench` 서브커맨드 (`skill/src/main.rs`):**
-    - CLI는 `omk bench [--docs <N>] [--turns <T>] [--json]` 명령어를 지원해야 한다 (기본값: `--docs 3000`, `--turns 80`).
+    - CLI는 `omk bench [--docs <N>] [--turns <T>] [--yes | -y] [--json]` 명령어를 지원해야 한다 (기본값: `--docs 3000`, `--turns 80`).
+    - **디스크 리소스 보호 임계치 및 상시 사전 승인 인터랙션 (`REQ-PERF-006` Safety Guard):**
+      - **절대 상한선 (Hard Cap Limit):** 로컬 디스크 및 Inode 고갈 사고를 원천 차단하기 위해 `--docs`는 최대 **`100,000`**, `--turns`는 최대 **`10,000`**을 초과할 수 없으며, 초과 입력 시 즉시 인자 검증 에러(`INVALID_ARGUMENT`)를 반환하고 실행을 차단해야 한다.
+      - **권고 임계치 및 초과 경고 (Soft Warning Threshold):** `--docs > 10,000` 또는 `--turns > 1,000`일 경우, 실행 전 권고 임계치 초과 및 디스크 I/O·소요 시간 증가에 대한 명시적 경고 문구(`[WARN]`)를 출력해야 한다.
+      - **상시 예상 디스크 사용량 고지 및 사용자 승인 프롬프트 (Always-on Pre-flight Confirmation):** 인터랙티브 터미널(TTY)에서 실행 시(단, `--yes`/`-y` 또는 `--json` 모드가 아닌 경우), 항상 시드 문서 수($N$), 시뮬레이션 턴 수($T$), **예상 임시 디스크 사용량(Estimated Temp Disk Usage, 문서당 약 `7.5 KB` + 인덱스 오버헤드 반영)**을 먼저 출력하고 사용자 승인(`Proceed with benchmark? [y/N]:`)을 받아야 한다. 사용자가 `y` 또는 `yes`를 입력하지 않으면 벤치마크를 즉시 취소하고 임시 파일을 생성하지 않아야 한다. 비대화형(Non-TTY) 환경에서 권고 임계치(`--docs > 10,000` 또는 `--turns > 1,000`)를 초과하여 실행하려면 반드시 `--yes`(`-y`) 플래그를 명시해야 한다.
+      - **RAII 임시 디렉터리 자동 정리 (`Drop` Guard):** 벤치마크 실행 도중 에러 조기 반환(`?`)이나 패닉이 발생하더라도 OS 임시 디렉터리(`omk_bench_<pid>_<nanos>`)가 누수 없이 삭제되도록 RAII `Drop` 가드로 생명주기를 보호해야 한다.
     - `omk bench`는 사용자의 실제 Vault를 건드리지 않고 임시 디렉터리에 $N$개의 문서를 고속 시드한 뒤 다음 **2대 검증 리포트**를 출력해야 한다:
       1. **Static Invariant Checks (정적 결정론적 지표 검증):**
          - `MET-STATIC-01` (Persistent UDS Connection: `connect_count == 1` across $M$ calls) : `PASS / FAIL`
